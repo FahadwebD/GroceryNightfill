@@ -1,15 +1,10 @@
+import { router, useFocusEffect } from 'expo-router';
 import {
   useCallback,
+  useEffect,
   useMemo,
   useState,
 } from 'react';
-
-import {
-  router,
-  useFocusEffect,
-} from 'expo-router';
-
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import {
   ScrollView,
@@ -19,41 +14,39 @@ import {
   View,
 } from 'react-native';
 
+import {
+  calculateLabourPosition,
+  formatClock,
+  formatMinutes,
+  formatSignedMinutes,
+  getCurrentNightMinutes,
+  getShiftWindow,
+  getTaskOrder,
+  isActiveRosterEntry,
+  type PlanningAllocation,
+  type PlanningRosterEntry,
+} from '../utils/nightfillPlanning';
+
+import {
+  getTonightContext,
+  NIGHTFILL_STORAGE,
+  readNightValue,
+  readStorage,
+} from '../utils/nightfillStorage';
+
 type Employee = {
   id: string;
   name: string;
-  employeeId: string;
-  employmentType: string;
-  contractDays: string[];
-  dayHours: Record<string, string>;
-  weeklyContractHours: number;
-  availableDays: string[];
-  notes: string;
-  createdAt: string;
+  employeeId?: string;
+  employmentType?: string;
+  contractDays?: string[];
+  dayHours?: Record<string, string>;
+  weeklyContractHours?: number;
+  availableDays?: string[];
+  notes?: string;
+  createdAt?: string;
   aisleSkills?: Record<string, number>;
 };
-
-type ShiftStatus =
-  | 'Working'
-  | 'Sick'
-  | 'Late'
-  | 'Left Early'
-  | 'No Show'
-  | 'Called In';
-
-type RosterEntry = {
-  employeeId: string;
-  hours: string;
-  startTime?: string;
-  finishTime?: string;
-  status: ShiftStatus;
-  isExtra: boolean;
-};
-
-type SavedRoster = Record<
-  string,
-  RosterEntry[]
->;
 
 type LoadItem = {
   name: string;
@@ -64,7 +57,8 @@ type LoadItem = {
 
 type NightLoad = {
   day: string;
-  photos: string[];
+  dateKey?: string;
+  photos?: string[];
   items: LoadItem[];
   totalCartons: number;
   totalRequiredMinutes: number;
@@ -73,25 +67,9 @@ type NightLoad = {
   protectMinutes: number;
   splittingMinutes: number;
   otherOrganisingMinutes: number;
-  totalWasDetected: boolean;
-  updatedAt: string;
+  totalWasDetected?: boolean;
+  updatedAt?: string;
 };
-
-type SavedLoads = Record<
-  string,
-  NightLoad
->;
-
-type Allocation = {
-  employeeId: string;
-  taskName: string;
-  minutes: number;
-};
-
-type SavedAllocations = Record<
-  string,
-  Allocation[]
->;
 
 type TaskStatus =
   | 'Not Started'
@@ -101,12 +79,8 @@ type TaskStatus =
 type ProgressItem = {
   taskName: string;
   status: TaskStatus;
+  completedAt?: string | null;
 };
-
-type SavedProgress = Record<
-  string,
-  ProgressItem[]
->;
 
 type LoadArrivalRecord = {
   day: string;
@@ -117,557 +91,263 @@ type LoadArrivalRecord = {
   updatedAt: string;
 };
 
-type SavedLoadArrivals = Record<
-  string,
-  LoadArrivalRecord
->;
+type LoadTask = {
+  name: string;
+  requiredMinutes: number;
+};
 
-const dayNames = [
-  'Sunday',
-  'Monday',
-  'Tuesday',
-  'Wednesday',
-  'Thursday',
-  'Friday',
-  'Saturday',
-];
+type WorkflowTone =
+  | 'done'
+  | 'active'
+  | 'waiting';
 
-function getNightfillDate() {
-  const now =
-    new Date();
-
-  const date =
-    new Date(now);
-
-  if (
-    date.getHours() < 5
-  ) {
-    date.setDate(
-      date.getDate() - 1
-    );
+function buildLoadTasks(
+  load: NightLoad | null
+): LoadTask[] {
+  if (!load) {
+    return [];
   }
 
-  return date;
-}
+  const result: LoadTask[] = [];
 
-function getDateKey(
-  date: Date
-) {
-  const year =
-    date.getFullYear();
-
-  const month =
-    String(
-      date.getMonth() + 1
-    ).padStart(
-      2,
-      '0'
-    );
-
-  const day =
-    String(
-      date.getDate()
-    ).padStart(
-      2,
-      '0'
-    );
-
-  return `${year}-${month}-${day}`;
-}
-
-function formatMinutes(
-  totalMinutes: number
-) {
-  const safe =
-    Math.max(
-      Math.round(
-        totalMinutes || 0
-      ),
-      0
-    );
-
-  const hours =
-    Math.floor(
-      safe / 60
-    );
-
-  const minutes =
-    safe % 60;
-
-  if (
-    hours === 0
-  ) {
-    return `${minutes}m`;
+  if (load.splittingMinutes > 0) {
+    result.push({
+      name: 'Splitting',
+      requiredMinutes:
+        load.splittingMinutes,
+    });
   }
 
-  if (
-    minutes === 0
-  ) {
-    return `${hours}h`;
-  }
+  load.items?.forEach((item) => {
+    const minutes =
+      (Number(item.hours) || 0) * 60 +
+      (Number(item.minutes) || 0);
 
-  return `${hours}h ${minutes}m`;
-}
-
-function normaliseTime(
-  value: string
-) {
-  const text =
-    value.trim();
-
-  if (!text) {
-    return '';
-  }
-
-  const parts =
-    text.split(':');
-
-  const hour =
-    Number(
-      parts[0]
-    );
-
-  const minute =
-    parts.length > 1
-      ? Number(
-          parts[1]
-        )
-      : 0;
-
-  if (
-    Number.isNaN(hour) ||
-    Number.isNaN(minute)
-  ) {
-    return '';
-  }
-
-  if (
-    hour < 0 ||
-    hour > 23 ||
-    minute < 0 ||
-    minute > 59
-  ) {
-    return '';
-  }
-
-  return `${String(
-    hour
-  ).padStart(
-    2,
-    '0'
-  )}:${String(
-    minute
-  ).padStart(
-    2,
-    '0'
-  )}`;
-}
-
-function timeToNightMinutes(
-  value: string
-) {
-  const time =
-    normaliseTime(
-      value
-    );
-
-  if (!time) {
-    return null;
-  }
-
-  const [
-    hour,
-    minute,
-  ] =
-    time
-      .split(':')
-      .map(Number);
-
-  let total =
-    hour * 60 +
-    minute;
-
-  if (
-    hour < 5
-  ) {
-    total +=
-      24 * 60;
-  }
-
-  return total;
-}
-
-function getCurrentNightMinutes() {
-  const now =
-    new Date();
-
-  let total =
-    now.getHours() *
-      60 +
-    now.getMinutes();
-
-  if (
-    now.getHours() < 5
-  ) {
-    total +=
-      24 * 60;
-  }
-
-  return total;
-}
-
-function formatClock(
-  value?: string | null
-) {
-  if (!value) {
-    return '—';
-  }
-
-  const time =
-    normaliseTime(
-      value
-    );
-
-  if (!time) {
-    return value;
-  }
-
-  const [
-    hour,
-    minute,
-  ] =
-    time
-      .split(':')
-      .map(Number);
-
-  const d =
-    new Date();
-
-  d.setHours(
-    hour,
-    minute,
-    0,
-    0
-  );
-
-  return d.toLocaleTimeString(
-    'en-AU',
-    {
-      hour:
-        'numeric',
-      minute:
-        '2-digit',
+    if (minutes <= 0) {
+      return;
     }
+
+    result.push({
+      name: item.name,
+      requiredMinutes: minutes,
+    });
+  });
+
+  if (
+    load.otherOrganisingMinutes > 0 &&
+    !result.some(
+      (item) =>
+        item.name ===
+        'Other / Organising'
+    )
+  ) {
+    result.push({
+      name: 'Other / Organising',
+      requiredMinutes:
+        load.otherOrganisingMinutes,
+    });
+  }
+
+  if (
+    load.promoMinutes > 0 &&
+    !result.some(
+      (item) =>
+        item.name === 'Promo'
+    )
+  ) {
+    result.push({
+      name: 'Promo',
+      requiredMinutes:
+        load.promoMinutes,
+    });
+  }
+
+  if (
+    load.protectMinutes > 0 &&
+    !result.some(
+      (item) =>
+        item.name ===
+        'Protect - Aisle'
+    )
+  ) {
+    result.push({
+      name: 'Protect - Aisle',
+      requiredMinutes:
+        load.protectMinutes,
+    });
+  }
+
+  return result.sort(
+    (a, b) =>
+      getTaskOrder(a.name) -
+      getTaskOrder(b.name)
   );
 }
 
-function calculateUsableMinutesAfterLoad(
-  startTime: string | undefined,
-  finishTime: string | undefined,
-  loadArrivalTime:
-    | string
-    | null
-    | undefined
+function getEmployeeName(
+  employees: Employee[],
+  employeeId: string
 ) {
-  if (
-    !startTime ||
-    !finishTime ||
-    !loadArrivalTime
-  ) {
-    return 0;
-  }
-
-  const start =
-    timeToNightMinutes(
-      startTime
-    );
-
-  const finishRaw =
-    timeToNightMinutes(
-      finishTime
-    );
-
-  const arrival =
-    timeToNightMinutes(
-      loadArrivalTime
-    );
-
-  if (
-    start === null ||
-    finishRaw === null ||
-    arrival === null
-  ) {
-    return 0;
-  }
-
-  let finish =
-    finishRaw;
-
-  if (
-    finish <=
-    start
-  ) {
-    finish +=
-      24 * 60;
-  }
-
-  if (
-    finish <=
-    arrival
-  ) {
-    return 0;
-  }
-
-  const usableStart =
-    Math.max(
-      start,
-      arrival
-    );
-
-  return Math.max(
-    finish -
-      usableStart,
-    0
-  );
-}
-
-function calculatePreLoadMinutes(
-  startTime: string | undefined,
-  finishTime: string | undefined,
-  loadArrivalTime:
-    | string
-    | null
-    | undefined
-) {
-  if (
-    !startTime ||
-    !finishTime ||
-    !loadArrivalTime
-  ) {
-    return 0;
-  }
-
-  const start =
-    timeToNightMinutes(
-      startTime
-    );
-
-  const finishRaw =
-    timeToNightMinutes(
-      finishTime
-    );
-
-  const arrival =
-    timeToNightMinutes(
-      loadArrivalTime
-    );
-
-  if (
-    start === null ||
-    finishRaw === null ||
-    arrival === null
-  ) {
-    return 0;
-  }
-
-  let finish =
-    finishRaw;
-
-  if (
-    finish <=
-    start
-  ) {
-    finish +=
-      24 * 60;
-  }
-
-  if (
-    start >=
-    arrival
-  ) {
-    return 0;
-  }
-
-  const preLoadEnd =
-    Math.min(
-      finish,
-      arrival
-    );
-
-  return Math.max(
-    preLoadEnd -
-      start,
-    0
+  return (
+    employees.find(
+      (employee) =>
+        employee.id === employeeId
+    )?.name || 'Team member'
   );
 }
 
 export default function TonightScreen() {
-  const [
-    employees,
-    setEmployees,
-  ] =
+  const nightContext =
+    useMemo(
+      () => getTonightContext(),
+      []
+    );
+
+  const {
+    date: nightfillDate,
+    dateKey,
+    dayName,
+  } = nightContext;
+
+  const [employees, setEmployees] =
     useState<Employee[]>([]);
 
-  const [
-    savedRoster,
-    setSavedRoster,
-  ] =
-    useState<SavedRoster>({});
+  const [roster, setRoster] =
+    useState<PlanningRosterEntry[]>([]);
 
-  const [
-    savedLoads,
-    setSavedLoads,
-  ] =
-    useState<SavedLoads>({});
+  const [load, setLoad] =
+    useState<NightLoad | null>(null);
 
-  const [
-    savedAllocations,
-    setSavedAllocations,
-  ] =
-    useState<SavedAllocations>(
-      {}
-    );
+  const [allocations, setAllocations] =
+    useState<PlanningAllocation[]>([]);
 
-  const [
-    savedProgress,
-    setSavedProgress,
-  ] =
-    useState<SavedProgress>(
-      {}
-    );
+  const [progress, setProgress] =
+    useState<ProgressItem[]>([]);
 
-  const [
-    loadArrival,
-    setLoadArrival,
-  ] =
+  const [loadArrival, setLoadArrival] =
     useState<LoadArrivalRecord | null>(
       null
     );
 
-  const [
-    loading,
-    setLoading,
-  ] =
+  const [loading, setLoading] =
     useState(true);
 
-  const nightfillDate =
-    getNightfillDate();
-
-  const currentDay =
-    dayNames[
-      nightfillDate.getDay()
-    ];
-
-  const dateKey =
-    getDateKey(
-      nightfillDate
-    );
+  const [clockTick, setClockTick] =
+    useState(0);
 
   const formattedDate =
-    nightfillDate.toLocaleDateString(
-      'en-AU',
-      {
-        weekday:
-          'long',
-        day:
-          'numeric',
-        month:
-          'long',
-      }
+    useMemo(
+      () =>
+        nightfillDate.toLocaleDateString(
+          'en-AU',
+          {
+            weekday: 'long',
+            day: 'numeric',
+            month: 'long',
+          }
+        ),
+      [nightfillDate]
     );
 
   async function loadTonightData() {
     try {
-      setLoading(
-        true
-      );
+      setLoading(true);
 
-      const storedEmployees =
-        await AsyncStorage.getItem(
-          'groceryEmployees'
+      const employeeData =
+        await readStorage<Employee[]>(
+          'groceryEmployees',
+          []
         );
 
-      setEmployees(
-        storedEmployees
-          ? JSON.parse(
-              storedEmployees
-            )
-          : []
-      );
+      setEmployees(employeeData);
 
+      /*
+       * Roster keeps a weekday fallback because the Week screen still
+       * represents the repeating weekly roster by Monday / Tuesday etc.
+       */
       const storedRoster =
-        await AsyncStorage.getItem(
-          'groceryNightRoster'
+        await readNightValue<
+          PlanningRosterEntry[]
+        >(
+          NIGHTFILL_STORAGE.roster,
+          dateKey,
+          dayName
         );
 
-      setSavedRoster(
-        storedRoster
-          ? JSON.parse(
-              storedRoster
+      if (storedRoster) {
+        setRoster(storedRoster);
+      } else {
+        const contractedFallback =
+          employeeData
+            .filter(
+              (employee) =>
+                employee.employmentType ===
+                  'Part-time' &&
+                employee.contractDays?.includes(
+                  dayName
+                )
             )
-          : {}
-      );
+            .map(
+              (
+                employee
+              ): PlanningRosterEntry => ({
+                employeeId: employee.id,
+                hours:
+                  employee.dayHours?.[
+                    dayName
+                  ] || '0',
+                startTime: '17:00',
+                finishTime: '',
+                status: 'Working',
+                isExtra: false,
+              })
+            );
 
-      const storedLoads =
-        await AsyncStorage.getItem(
-          'groceryNightLoads'
+        setRoster(
+          contractedFallback
         );
+      }
 
-      setSavedLoads(
-        storedLoads
-          ? JSON.parse(
-              storedLoads
-            )
-          : {}
-      );
-
-      const storedAllocations =
-        await AsyncStorage.getItem(
-          'groceryNightAllocations'
-        );
-
-      setSavedAllocations(
-        storedAllocations
-          ? JSON.parse(
-              storedAllocations
-            )
-          : {}
-      );
-
-      const storedProgress =
-        await AsyncStorage.getItem(
-          'groceryNightProgress'
-        );
-
-      setSavedProgress(
-        storedProgress
-          ? JSON.parse(
-              storedProgress
-            )
-          : {}
-      );
-
-      const storedArrival =
-        await AsyncStorage.getItem(
-          'groceryLoadArrivals'
-        );
-
-      const parsedArrival:
-        SavedLoadArrivals =
-        storedArrival
-          ? JSON.parse(
-              storedArrival
-            )
-          : {};
-
-      setLoadArrival(
-        parsedArrival[
+      /*
+       * Operational night data is date-first and date-only here.
+       * We deliberately do not show a stale previous Friday load on a new
+       * Friday just because an old weekday compatibility key exists.
+       */
+      const [
+        storedLoad,
+        storedAllocations,
+        storedProgress,
+        storedArrival,
+      ] = await Promise.all([
+        readNightValue<NightLoad>(
+          NIGHTFILL_STORAGE.loads,
           dateKey
-        ] ||
-          parsedArrival[
-            currentDay
-          ] ||
-          null
+        ),
+        readNightValue<
+          PlanningAllocation[]
+        >(
+          NIGHTFILL_STORAGE.allocations,
+          dateKey
+        ),
+        readNightValue<ProgressItem[]>(
+          NIGHTFILL_STORAGE.progress,
+          dateKey
+        ),
+        readNightValue<LoadArrivalRecord>(
+          NIGHTFILL_STORAGE.arrivals,
+          dateKey
+        ),
+      ]);
+
+      setLoad(storedLoad);
+      setAllocations(
+        storedAllocations || []
+      );
+      setProgress(
+        storedProgress || []
+      );
+      setLoadArrival(
+        storedArrival
       );
     } catch (error) {
       console.log(
@@ -675,1516 +355,1108 @@ export default function TonightScreen() {
         error
       );
     } finally {
-      setLoading(
-        false
-      );
+      setLoading(false);
     }
   }
 
   useFocusEffect(
     useCallback(() => {
       loadTonightData();
-    }, [])
+    }, [dateKey, dayName])
   );
 
-  const contractedEmployees =
-    useMemo(() => {
-      return employees.filter(
-        (employee) =>
-          employee.employmentType ===
-            'Part-time' &&
-          employee.contractDays?.includes(
-            currentDay
-          )
-      );
-    }, [
-      employees,
-      currentDay,
-    ]);
+  useEffect(() => {
+    const interval =
+      setInterval(() => {
+        setClockTick(
+          (value) => value + 1
+        );
+      }, 30_000);
 
-  const tonightRoster =
-    useMemo(() => {
-      const saved =
-        savedRoster[
-          currentDay
-        ];
+    return () =>
+      clearInterval(interval);
+  }, []);
 
-      if (saved) {
-        return saved;
-      }
-
-      return contractedEmployees.map(
-        (
-          employee
-        ): RosterEntry => ({
-          employeeId:
-            employee.id,
-
-          hours:
-            employee.dayHours?.[
-              currentDay
-            ] || '0',
-
-          startTime:
-            '17:00',
-
-          finishTime:
-            '',
-
-          status:
-            'Working',
-
-          isExtra:
-            false,
-        })
-      );
-    }, [
-      savedRoster,
-      currentDay,
-      contractedEmployees,
-    ]);
-
-  function getEmployee(
-    employeeId: string
-  ) {
-    return employees.find(
-      (employee) =>
-        employee.id ===
-        employeeId
-    );
-  }
-
-  const tonightLoad =
-    savedLoads[
-      currentDay
-    ];
-
-  const requiredMinutes =
-    tonightLoad
-      ?.totalRequiredMinutes ||
-    0;
-
-  const requiredHours =
-    requiredMinutes /
-    60;
-
-  const totalCartons =
-    tonightLoad
-      ?.totalCartons ||
-    0;
-
-  const splittingMinutes =
-    tonightLoad
-      ?.splittingMinutes ||
-    0;
-
-  const aisleMinutes =
-    tonightLoad
-      ?.aisleMinutes ||
-    0;
-
-  const promoMinutes =
-    tonightLoad
-      ?.promoMinutes ||
-    0;
-
-  const protectMinutes =
-    tonightLoad
-      ?.protectMinutes ||
-    0;
-
-  const organisingMinutes =
-    tonightLoad
-      ?.otherOrganisingMinutes ||
-    0;
-
-  const workingRoster =
-    tonightRoster.filter(
-      (entry) =>
-        entry.status !==
-          'Sick' &&
-        entry.status !==
-          'No Show'
+  const activeRoster =
+    useMemo(
+      () =>
+        roster.filter(
+          isActiveRosterEntry
+        ),
+      [roster]
     );
 
-  const rosteredMinutes =
-    workingRoster.reduce(
-      (
-        total,
-        entry
-      ) =>
-        total +
-        (
-          Number(
-            entry.hours
-          ) || 0
-        ) *
-          60,
-      0
-    );
-
-  const rosteredHours =
-    rosteredMinutes /
-    60;
-
-  const workingTeamCount =
-    workingRoster.length;
-
-  const labourDifference =
-    requiredHours >
-    0
-      ? rosteredHours -
-        requiredHours
-      : 0;
-
-  /*
-  |--------------------------------------------------------------------------
-  | REAL POST-ARRIVAL LABOUR
-  |--------------------------------------------------------------------------
-  */
-
-  const actualLoadArrivalTime =
+  const actualArrivalTime =
     loadArrival?.arrived
       ? loadArrival.actualTime
       : null;
 
-  const preLoadLabourMinutes =
-    actualLoadArrivalTime
-      ? workingRoster.reduce(
-          (
-            total,
-            entry
-          ) =>
-            total +
-            calculatePreLoadMinutes(
-              entry.startTime,
-              entry.finishTime,
-              actualLoadArrivalTime
-            ),
-          0
-        )
-      : 0;
+  const requiredMinutes =
+    load?.totalRequiredMinutes || 0;
 
-  const postArrivalLabourMinutes =
-    actualLoadArrivalTime
-      ? workingRoster.reduce(
-          (
-            total,
-            entry
-          ) =>
-            total +
-            calculateUsableMinutesAfterLoad(
-              entry.startTime,
-              entry.finishTime,
-              actualLoadArrivalTime
-            ),
-          0
-        )
-      : rosteredMinutes;
-
-  const realLoadDifferenceMinutes =
-    postArrivalLabourMinutes -
-    requiredMinutes;
-
-  const sickCount =
-    tonightRoster.filter(
-      (entry) =>
-        entry.status ===
-        'Sick'
-    ).length;
-
-  const lateCount =
-    tonightRoster.filter(
-      (entry) =>
-        entry.status ===
-        'Late'
-    ).length;
-
-  const noShowCount =
-    tonightRoster.filter(
-      (entry) =>
-        entry.status ===
-        'No Show'
-    ).length;
-
-  const calledInCount =
-    tonightRoster.filter(
-      (entry) =>
-        entry.isExtra ||
-        entry.status ===
-          'Called In'
-    ).length;
-
-  const tonightAllocations =
-    savedAllocations[
-      currentDay
-    ] || [];
-
-  const totalAllocatedMinutes =
-    tonightAllocations.reduce(
-      (
-        total,
-        allocation
-      ) =>
-        total +
-        allocation.minutes,
-      0
+  const labourPosition =
+    useMemo(
+      () =>
+        calculateLabourPosition(
+          roster,
+          requiredMinutes,
+          actualArrivalTime
+        ),
+      [
+        roster,
+        requiredMinutes,
+        actualArrivalTime,
+      ]
     );
 
-  const allocationRemainingMinutes =
-    Math.max(
-      postArrivalLabourMinutes -
-        totalAllocatedMinutes,
-      0
+  const tasks =
+    useMemo(
+      () => buildLoadTasks(load),
+      [load]
     );
 
-  const allocatedEmployeeCount =
-    new Set(
-      tonightAllocations.map(
-        (allocation) =>
-          allocation.employeeId
-      )
-    ).size;
+  const taskRequirementByName =
+    useMemo(() => {
+      return tasks.reduce<
+        Record<string, number>
+      >(
+        (result, task) => {
+          result[task.name] =
+            task.requiredMinutes;
+          return result;
+        },
+        {}
+      );
+    }, [tasks]);
 
-  const allocatedTaskNames =
-    Array.from(
-      new Set(
-        tonightAllocations
-          .filter(
-            (item) =>
-              item.minutes >
+  const taskAllocatedByName =
+    useMemo(() => {
+      return allocations.reduce<
+        Record<string, number>
+      >(
+        (result, item) => {
+          result[item.taskName] =
+            (result[item.taskName] || 0) +
+            Math.max(
+              Number(item.minutes) || 0,
               0
-          )
-          .map(
-            (item) =>
-              item.taskName
-          )
-      )
+            );
+          return result;
+        },
+        {}
+      );
+    }, [allocations]);
+
+  const allocatedMinutes =
+    allocations.reduce(
+      (total, item) =>
+        total +
+        Math.max(
+          Number(item.minutes) || 0,
+          0
+        ),
+      0
     );
 
-  const tonightProgress =
-    savedProgress[
-      currentDay
-    ] || [];
+  const fullyAllocatedTaskCount =
+    tasks.filter(
+      (task) =>
+        (taskAllocatedByName[
+          task.name
+        ] || 0) >=
+        task.requiredMinutes
+    ).length;
 
   const completedTaskCount =
-    allocatedTaskNames.filter(
-      (taskName) =>
-        tonightProgress.some(
+    tasks.filter(
+      (task) =>
+        progress.find(
           (item) =>
             item.taskName ===
-              taskName &&
-            item.status ===
-              'Complete'
-        )
+              task.name
+        )?.status === 'Complete'
     ).length;
 
   const inProgressTaskCount =
-    allocatedTaskNames.filter(
-      (taskName) =>
-        tonightProgress.some(
-          (item) =>
-            item.taskName ===
-              taskName &&
-            item.status ===
-              'In Progress'
-        )
+    progress.filter(
+      (item) =>
+        item.status ===
+        'In Progress'
     ).length;
 
-  const totalTaskCount =
-    allocatedTaskNames.length;
+  const sickCount =
+    roster.filter(
+      (entry) =>
+        entry.status === 'Sick'
+    ).length;
 
-  /*
-  |--------------------------------------------------------------------------
-  | REAL-TIME TEAM
-  |--------------------------------------------------------------------------
-  */
+  const lateCount =
+    roster.filter(
+      (entry) =>
+        entry.status === 'Late'
+    ).length;
 
-  const realTimeTeam =
-    useMemo(() => {
-      const nowMinutes =
-        getCurrentNightMinutes();
+  const nowNightMinute =
+    useMemo(
+      () =>
+        getCurrentNightMinutes(),
+      [clockTick]
+    );
 
-      let onShift =
-        0;
+  const activeNowCount =
+    activeRoster.filter((entry) => {
+      const window =
+        getShiftWindow(entry);
 
-      let startingLater =
-        0;
-
-      let finished =
-        0;
-
-      workingRoster.forEach(
-        (entry) => {
-          const start =
-            entry.startTime
-              ? timeToNightMinutes(
-                  entry.startTime
-                )
-              : null;
-
-          let finish =
-            entry.finishTime
-              ? timeToNightMinutes(
-                  entry.finishTime
-                )
-              : null;
-
-          if (
-            start === null ||
-            finish === null
-          ) {
-            return;
-          }
-
-          if (
-            finish <=
-            start
-          ) {
-            finish +=
-              24 * 60;
-          }
-
-          if (
-            nowMinutes <
-            start
-          ) {
-            startingLater +=
-              1;
-          } else if (
-            nowMinutes >=
-              start &&
-            nowMinutes <
-              finish
-          ) {
-            onShift +=
-              1;
-          } else {
-            finished +=
-              1;
-          }
-        }
+      return (
+        nowNightMinute >=
+          window.startMinute &&
+        nowNightMinute <
+          window.finishMinute
       );
+    }).length;
 
-      return {
-        onShift,
-        startingLater,
-        finished,
-      };
-    }, [
-      workingRoster,
-    ]);
+  const totalCartons =
+    load?.totalCartons || 0;
 
-  function getStatusColor(
-    status: ShiftStatus
-  ) {
-    if (
-      status === 'Sick' ||
-      status ===
-        'No Show'
-    ) {
-      return {
-        background:
-          '#FDECEC',
-        text:
-          '#D92D20',
-      };
-    }
+  const splittingMinutes =
+    load?.splittingMinutes || 0;
 
-    if (
-      status ===
-        'Late' ||
-      status ===
-        'Left Early'
-    ) {
-      return {
-        background:
-          '#FFF4E5',
-        text:
-          '#B54708',
-      };
-    }
+  const aisleMinutes =
+    load?.aisleMinutes || 0;
 
-    return {
-      background:
-        '#E8F8EF',
-      text:
-        '#168455',
-    };
+  const promoMinutes =
+    load?.promoMinutes || 0;
+
+  const protectMinutes =
+    load?.protectMinutes || 0;
+
+  const organisingMinutes =
+    load?.otherOrganisingMinutes || 0;
+
+  const allocationDifference =
+    allocatedMinutes -
+    requiredMinutes;
+
+  const allocationCoverage =
+    requiredMinutes > 0
+      ? Math.round(
+          (allocatedMinutes /
+            requiredMinutes) *
+            100
+        )
+      : 0;
+
+  const loadWorkflowTone:
+    WorkflowTone =
+    load
+      ? 'done'
+      : 'active';
+
+  const arrivalWorkflowTone:
+    WorkflowTone =
+    loadArrival?.arrived
+      ? 'done'
+      : load
+        ? 'active'
+        : 'waiting';
+
+  const allocationWorkflowTone:
+    WorkflowTone =
+    requiredMinutes > 0 &&
+    fullyAllocatedTaskCount ===
+      tasks.length &&
+    tasks.length > 0
+      ? 'done'
+      : loadArrival?.arrived
+        ? 'active'
+        : 'waiting';
+
+  const progressWorkflowTone:
+    WorkflowTone =
+    tasks.length > 0 &&
+    completedTaskCount ===
+      tasks.length
+      ? 'done'
+      : allocations.length > 0
+        ? 'active'
+        : 'waiting';
+
+  const heroTitle =
+    !load
+      ? 'Scan tonight’s load'
+      : !loadArrival?.arrived
+        ? 'Waiting for load arrival'
+        : labourPosition.shortageMinutes > 0
+          ? `${formatMinutes(
+              labourPosition.shortageMinutes
+            )} labour shortage`
+          : 'Nightfill labour covered';
+
+  const heroSubtitle =
+    !load
+      ? 'Add Fill Assist data to calculate tonight’s real labour position.'
+      : !loadArrival?.arrived
+        ? 'Roster labour is still projected. Record the actual truck arrival for the real position.'
+        : labourPosition.shortageMinutes > 0
+          ? `${formatMinutes(
+              labourPosition.postArrivalMinutes
+            )} available after arrival against ${formatMinutes(
+              requiredMinutes
+            )} required.`
+          : `${formatMinutes(
+              labourPosition.surplusMinutes
+            )} post-arrival labour remains above the load requirement.`;
+
+  if (loading) {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.loadingText}>
+          Loading tonight...
+        </Text>
+      </View>
+    );
   }
 
   return (
-    <View
-      style={
-        styles.container
-      }
-    >
-      <View
-        style={
-          styles.header
-        }
-      >
-        <Text
-          style={
-            styles.smallTitle
-          }
-        >
+    <View style={styles.container}>
+      <View style={styles.header}>
+        <Text style={styles.eyebrow}>
           GROCERY NIGHTFILL
         </Text>
 
-        <Text
-          style={
-            styles.title
-          }
-        >
+        <Text style={styles.title}>
           Tonight
         </Text>
 
-        <Text
-          style={
-            styles.date
-          }
-        >
-          {formattedDate}
+        <Text style={styles.subtitle}>
+          {formattedDate} · 5 PM–5 AM
         </Text>
 
-        <Text
-          style={
-            styles.nightLabel
-          }
-        >
-          {currentDay} Nightfill · 5 PM–5 AM
+        <Text style={styles.dateKeyText}>
+          Night {dateKey}
         </Text>
       </View>
 
       <ScrollView
+        showsVerticalScrollIndicator={false}
         contentContainerStyle={
           styles.content
         }
-        showsVerticalScrollIndicator={
-          false
-        }
       >
-        <Text
-          style={
-            styles.sectionTitle
-          }
+        <View
+          style={[
+            styles.heroCard,
+            labourPosition.shortageMinutes >
+              0 &&
+              loadArrival?.arrived
+              ? styles.heroDanger
+              : styles.heroPrimary,
+          ]}
         >
-          Real-Time Night
+          <Text style={styles.heroKicker}>
+            NIGHT POSITION
+          </Text>
+
+          <Text style={styles.heroTitle}>
+            {heroTitle}
+          </Text>
+
+          <Text style={styles.heroSubtitle}>
+            {heroSubtitle}
+          </Text>
+
+          {loadArrival?.arrived && (
+            <View style={styles.heroFooter}>
+              <Text style={styles.heroFooterLabel}>
+                Actual load
+              </Text>
+
+              <Text style={styles.heroFooterValue}>
+                {formatClock(
+                  loadArrival.actualTime
+                )}
+              </Text>
+            </View>
+          )}
+        </View>
+
+        <Text style={styles.sectionTitle}>
+          Night Workflow
         </Text>
 
-        <TouchableOpacity
-          style={
-            styles.realTimeCard
-          }
-          activeOpacity={
-            0.8
-          }
-          onPress={() =>
-            router.push(
-              '/load-arrival'
-            )
-          }
-        >
-          <View
-            style={
-              styles.realTimeTop
-            }
-          >
-            <View>
-              <Text
-                style={
-                  styles.realTimeLabel
-                }
-              >
-                LOAD
-              </Text>
-
-              <Text
-                style={
-                  loadArrival
-                    ?.arrived
-                    ? styles.arrivedText
-                    : styles.waitingText
-                }
-              >
-                {loadArrival
-                  ?.arrived
-                  ? `Arrived ${formatClock(
-                      loadArrival.actualTime
-                    )}`
-                  : 'Waiting for load'}
-              </Text>
-            </View>
-
-            <Text
-              style={
-                styles.arrow
-              }
-            >
-              ›
-            </Text>
-          </View>
-
-          <View
-            style={
-              styles.realTimeStats
-            }
-          >
-            <View
-              style={
-                styles.realTimeStat
-              }
-            >
-              <Text
-                style={
-                  styles.realTimeStatLabel
-                }
-              >
-                On Shift Now
-              </Text>
-
-              <Text
-                style={
-                  styles.onShiftNumber
-                }
-              >
-                {
-                  realTimeTeam.onShift
-                }
-              </Text>
-            </View>
-
-            <View
-              style={
-                styles.realTimeDivider
-              }
-            />
-
-            <View
-              style={
-                styles.realTimeStat
-              }
-            >
-              <Text
-                style={
-                  styles.realTimeStatLabel
-                }
-              >
-                Starting Later
-              </Text>
-
-              <Text
-                style={
-                  styles.laterNumber
-                }
-              >
-                {
-                  realTimeTeam.startingLater
-                }
-              </Text>
-            </View>
-
-            <View
-              style={
-                styles.realTimeDivider
-              }
-            />
-
-            <View
-              style={
-                styles.realTimeStat
-              }
-            >
-              <Text
-                style={
-                  styles.realTimeStatLabel
-                }
-              >
-                Finished
-              </Text>
-
-              <Text
-                style={
-                  styles.finishedNumber
-                }
-              >
-                {
-                  realTimeTeam.finished
-                }
-              </Text>
-            </View>
-          </View>
-        </TouchableOpacity>
-
-        {loadArrival?.arrived && (
-          <>
-            <Text
-              style={
-                styles.sectionTitle
-              }
-            >
-              Real Load Labour
-            </Text>
-
-            <View
-              style={
-                styles.realLabourCard
-              }
-            >
-              <View
-                style={
-                  styles.realLabourRow
-                }
-              >
-                <Text
-                  style={
-                    styles.realLabourLabel
-                  }
-                >
-                  Full roster labour
-                </Text>
-
-                <Text
-                  style={
-                    styles.realLabourValue
-                  }
-                >
-                  {formatMinutes(
-                    rosteredMinutes
-                  )}
-                </Text>
-              </View>
-
-              <View
-                style={
-                  styles.realLabourRow
-                }
-              >
-                <Text
-                  style={
-                    styles.realLabourLabel
-                  }
-                >
-                  Labour before load
-                </Text>
-
-                <Text
-                  style={
-                    styles.preLoadValue
-                  }
-                >
-                  {formatMinutes(
-                    preLoadLabourMinutes
-                  )}
-                </Text>
-              </View>
-
-              <View
-                style={
-                  styles.realLabourDivider
-                }
-              />
-
-              <View
-                style={
-                  styles.realLabourRow
-                }
-              >
-                <Text
-                  style={
-                    styles.realLabourStrongLabel
-                  }
-                >
-                  Available after arrival
-                </Text>
-
-                <Text
-                  style={
-                    styles.postArrivalValue
-                  }
-                >
-                  {formatMinutes(
-                    postArrivalLabourMinutes
-                  )}
-                </Text>
-              </View>
-
-              <View
-                style={
-                  styles.realLabourRow
-                }
-              >
-                <Text
-                  style={
-                    styles.realLabourStrongLabel
-                  }
-                >
-                  Load required
-                </Text>
-
-                <Text
-                  style={
-                    styles.realLabourValue
-                  }
-                >
-                  {formatMinutes(
-                    requiredMinutes
-                  )}
-                </Text>
-              </View>
-
-              <View
-                style={[
-                  styles.realDifferenceBox,
-
-                  realLoadDifferenceMinutes <
-                    0
-                    ? styles.shortageBox
-                    : styles.surplusBox,
-                ]}
-              >
-                <Text
-                  style={
-                    styles.realDifferenceLabel
-                  }
-                >
-                  {realLoadDifferenceMinutes <
-                  0
-                    ? 'REAL LABOUR SHORTAGE'
-                    : 'REAL LABOUR SURPLUS'}
-                </Text>
-
-                <Text
-                  style={[
-                    styles.realDifferenceValue,
-
-                    realLoadDifferenceMinutes <
-                      0
-                      ? styles.shortageText
-                      : styles.surplusText,
-                  ]}
-                >
-                  {realLoadDifferenceMinutes <
-                  0
-                    ? `-${formatMinutes(
-                        Math.abs(
-                          realLoadDifferenceMinutes
-                        )
-                      )}`
-                    : `+${formatMinutes(
-                        realLoadDifferenceMinutes
-                      )}`}
-                </Text>
-              </View>
-            </View>
-          </>
-        )}
-
-        <TouchableOpacity
-          style={
-            styles.scanButton
-          }
-          activeOpacity={
-            0.7
-          }
-          onPress={() =>
-            router.push(
-              '/scan-load'
-            )
-          }
-        >
-          <View
-            style={
-              styles.cameraBox
-            }
-          >
-            <Text
-              style={
-                styles.cameraIcon
-              }
-            >
-              📷
-            </Text>
-          </View>
-
-          <View
-            style={
-              styles.scanContent
-            }
-          >
-            <Text
-              style={
-                styles.scanTitle
-              }
-            >
-              {tonightLoad
-                ? 'View / Update Load'
-                : "Scan Tonight's Load"}
-            </Text>
-
-            <Text
-              style={
-                styles.scanSubtitle
-              }
-            >
-              {tonightLoad
+        <View style={styles.workflowCard}>
+          <WorkflowRow
+            step="1"
+            title="Fill Assist Load"
+            detail={
+              load
                 ? `${totalCartons} cartons · ${formatMinutes(
                     requiredMinutes
-                  )} required`
-                : 'Photograph Fill Assist and analyze tonight’s load'}
-            </Text>
-          </View>
-
-          <Text
-            style={
-              styles.arrow
+                  )}`
+                : 'Not scanned yet'
             }
-          >
-            ›
-          </Text>
-        </TouchableOpacity>
-
-        <Text
-          style={
-            styles.sectionTitle
-          }
-        >
-          Tonight&apos;s Overview
-        </Text>
-
-        <View
-          style={
-            styles.overviewGrid
-          }
-        >
-          <OverviewCard
-            label="Required Hours"
-            value={
-              requiredMinutes >
-              0
-                ? formatMinutes(
-                    requiredMinutes
-                  )
-                : '—'
+            tone={loadWorkflowTone}
+            onPress={() =>
+              router.push('/scan-load')
             }
           />
 
-          <OverviewCard
-            label="Rostered Hours"
-            value={
-              loading
-                ? '...'
-                : formatMinutes(
-                    rosteredMinutes
-                  )
+          <WorkflowRow
+            step="2"
+            title="Load Arrival"
+            detail={
+              loadArrival?.arrived
+                ? `Arrived ${formatClock(
+                    loadArrival.actualTime
+                  )}`
+                : `Expected ${formatClock(
+                    loadArrival
+                      ?.expectedTime ||
+                      '19:00'
+                  )}`
+            }
+            tone={arrivalWorkflowTone}
+            onPress={() =>
+              router.push('/load-arrival')
             }
           />
 
-          <OverviewCard
-            label="Original Difference"
-            value={
-              requiredHours >
-              0
-                ? `${
-                    labourDifference >
-                    0
-                      ? '+'
+          <WorkflowRow
+            step="3"
+            title="Smart Allocation"
+            detail={
+              allocations.length > 0
+                ? `${fullyAllocatedTaskCount}/${tasks.length} tasks covered · ${allocationCoverage}% labour allocated`
+                : 'Suggestions ready after roster + load'
+            }
+            tone={allocationWorkflowTone}
+            onPress={() =>
+              router.push('/allocation')
+            }
+          />
+
+          <WorkflowRow
+            step="4"
+            title="Live Progress"
+            detail={
+              tasks.length > 0
+                ? `${completedTaskCount}/${tasks.length} complete${
+                    inProgressTaskCount > 0
+                      ? ` · ${inProgressTaskCount} in progress`
                       : ''
-                  }${labourDifference.toFixed(
-                    1
-                  )}h`
-                : '—'
+                  }`
+                : 'Starts after allocation'
             }
-            valueStyle={
-              requiredHours >
-              0
-                ? labourDifference <
-                  0
-                  ? styles.shortageText
-                  : styles.surplusText
-                : undefined
+            tone={progressWorkflowTone}
+            onPress={() =>
+              router.push('/live-progress')
             }
-          />
-
-          <OverviewCard
-            label="Team Working"
-            value={
-              loading
-                ? '...'
-                : String(
-                    workingTeamCount
-                  )
-            }
+            last
           />
         </View>
 
-        {tonightLoad && (
-          <>
-            <Text
-              style={
-                styles.sectionTitle
-              }
-            >
-              Fill Assist Labour
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitleNoMargin}>
+            Real Labour Position
+          </Text>
+
+          <TouchableOpacity
+            onPress={() =>
+              router.push('/week')
+            }
+          >
+            <Text style={styles.linkText}>
+              Edit roster
             </Text>
+          </TouchableOpacity>
+        </View>
 
-            <View
-              style={
-                styles.loadSummaryCard
-              }
-            >
-              <SummaryRow
-                label="Total Required"
-                value={formatMinutes(
-                  requiredMinutes
-                )}
-              />
+        <View style={styles.labourCard}>
+          <SummaryRow
+            label="Full roster labour"
+            value={formatMinutes(
+              labourPosition.fullRosterMinutes
+            )}
+          />
 
-              <SummaryRow
-                label="Aisle Fill"
-                value={formatMinutes(
-                  aisleMinutes
-                )}
-              />
+          {loadArrival?.arrived && (
+            <SummaryRow
+              label="Labour before load"
+              value={formatMinutes(
+                labourPosition.preLoadMinutes
+              )}
+              tone="warning"
+            />
+          )}
 
-              <SummaryRow
-                label="Splitting"
-                value={formatMinutes(
-                  splittingMinutes
-                )}
-                highlight
-              />
+          <SummaryRow
+            label={
+              loadArrival?.arrived
+                ? 'Available after arrival'
+                : 'Projected load labour'
+            }
+            value={formatMinutes(
+              labourPosition.postArrivalMinutes
+            )}
+            tone="primary"
+          />
 
-              <SummaryRow
-                label="Promo"
-                value={formatMinutes(
-                  promoMinutes
-                )}
-              />
+          <SummaryRow
+            label="Load required"
+            value={formatMinutes(
+              requiredMinutes
+            )}
+          />
 
-              <SummaryRow
-                label="Protect"
-                value={formatMinutes(
-                  protectMinutes
-                )}
-              />
+          <View style={styles.divider} />
 
-              <SummaryRow
-                label="Other / Organising"
-                value={formatMinutes(
-                  organisingMinutes
-                )}
-              />
+          <SummaryRow
+            label={
+              labourPosition.differenceMinutes <
+              0
+                ? 'REAL SHORTAGE'
+                : 'REAL SURPLUS'
+            }
+            value={
+              requiredMinutes > 0
+                ? formatSignedMinutes(
+                    labourPosition.differenceMinutes
+                  )
+                : '—'
+            }
+            tone={
+              labourPosition.differenceMinutes <
+              0
+                ? 'danger'
+                : 'good'
+            }
+          />
 
-              <SummaryRow
-                label="Cartons"
-                value={String(
-                  totalCartons
-                )}
+          {requiredMinutes > 0 && (
+            <View style={styles.coverageTrack}>
+              <View
+                style={[
+                  styles.coverageFill,
+                  {
+                    width: `${Math.min(
+                      labourPosition.coveragePercent,
+                      100
+                    )}%`,
+                  },
+                ]}
               />
             </View>
-          </>
-        )}
+          )}
 
-        <Text
-          style={
-            styles.sectionTitle
-          }
-        >
-          Tonight&apos;s Plan
-        </Text>
-
-        <View
-          style={
-            styles.planSummaryCard
-          }
-        >
-          <View
-            style={
-              styles.planStat
-            }
-          >
-            <Text
-              style={
-                styles.planStatLabel
-              }
-            >
-              Allocated
+          {requiredMinutes > 0 && (
+            <Text style={styles.coverageText}>
+              {labourPosition.coveragePercent}% of required labour covered by post-arrival capacity
             </Text>
-
-            <Text
-              style={
-                styles.planStatValue
-              }
-            >
-              {formatMinutes(
-                totalAllocatedMinutes
-              )}
-            </Text>
-          </View>
-
-          <View
-            style={
-              styles.planDivider
-            }
-          />
-
-          <View
-            style={
-              styles.planStat
-            }
-          >
-            <Text
-              style={
-                styles.planStatLabel
-              }
-            >
-              Staff Planned
-            </Text>
-
-            <Text
-              style={
-                styles.planStatValue
-              }
-            >
-              {
-                allocatedEmployeeCount
-              }
-            </Text>
-          </View>
-
-          <View
-            style={
-              styles.planDivider
-            }
-          />
-
-          <View
-            style={
-              styles.planStat
-            }
-          >
-            <Text
-              style={
-                styles.planStatLabel
-              }
-            >
-              Load Hours Left
-            </Text>
-
-            <Text
-              style={
-                styles.planRemaining
-              }
-            >
-              {formatMinutes(
-                allocationRemainingMinutes
-              )}
-            </Text>
-          </View>
+          )}
         </View>
 
-        {totalTaskCount >
-          0 && (
-          <>
-            <Text
-              style={
-                styles.sectionTitle
-              }
-            >
-              Live Status
+        <Text style={styles.sectionTitle}>
+          Tonight at a Glance
+        </Text>
+
+        <View style={styles.metricGrid}>
+          <MetricTile
+            label="Working Team"
+            value={String(
+              activeRoster.length
+            )}
+            sub={`${activeNowCount} active now`}
+          />
+
+          <MetricTile
+            label="Cartons"
+            value={String(totalCartons)}
+            sub="Fill Assist"
+          />
+
+          <MetricTile
+            label="Allocated"
+            value={formatMinutes(
+              allocatedMinutes
+            )}
+            sub={
+              requiredMinutes > 0
+                ? formatSignedMinutes(
+                    allocationDifference
+                  )
+                : 'No load yet'
+            }
+          />
+
+          <MetricTile
+            label="Tasks Complete"
+            value={`${completedTaskCount}/${tasks.length}`}
+            sub={
+              inProgressTaskCount > 0
+                ? `${inProgressTaskCount} running`
+                : 'Live progress'
+            }
+          />
+        </View>
+
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitleNoMargin}>
+            Load Breakdown
+          </Text>
+
+          <TouchableOpacity
+            onPress={() =>
+              router.push('/scan-load')
+            }
+          >
+            <Text style={styles.linkText}>
+              Review load
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {!load ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyTitle}>
+              No Fill Assist load saved for {dateKey}
+            </Text>
+
+            <Text style={styles.emptyText}>
+              Scan tonight’s load. The dashboard will then calculate required labour and compare it with the roster.
             </Text>
 
             <TouchableOpacity
-              style={
-                styles.liveStatusCard
-              }
+              style={styles.primaryButton}
               onPress={() =>
-                router.push(
-                  '/live-progress'
-                )
+                router.push('/scan-load')
               }
             >
-              <View
-                style={
-                  styles.liveStatusItem
-                }
-              >
-                <Text
-                  style={
-                    styles.liveStatusLabel
-                  }
-                >
-                  Complete
-                </Text>
-
-                <Text
-                  style={
-                    styles.liveCompleteValue
-                  }
-                >
-                  {completedTaskCount}/
-                  {totalTaskCount}
-                </Text>
-              </View>
-
-              <View
-                style={
-                  styles.liveStatusDivider
-                }
-              />
-
-              <View
-                style={
-                  styles.liveStatusItem
-                }
-              >
-                <Text
-                  style={
-                    styles.liveStatusLabel
-                  }
-                >
-                  In Progress
-                </Text>
-
-                <Text
-                  style={
-                    styles.liveProgressValue
-                  }
-                >
-                  {
-                    inProgressTaskCount
-                  }
-                </Text>
-              </View>
-
-              <Text
-                style={
-                  styles.arrow
-                }
-              >
-                ›
+              <Text style={styles.primaryButtonText}>
+                Scan Fill Assist
               </Text>
             </TouchableOpacity>
-          </>
-        )}
+          </View>
+        ) : (
+          <View style={styles.breakdownCard}>
+            <BreakdownRow
+              label="Aisle Fill"
+              value={formatMinutes(
+                aisleMinutes
+              )}
+            />
 
-        <Text
-          style={
-            styles.sectionTitle
-          }
-        >
-          Attendance
-        </Text>
+            <BreakdownRow
+              label="Splitting"
+              value={formatMinutes(
+                splittingMinutes
+              )}
+              accent
+            />
 
-        <View
-          style={
-            styles.statusSummary
-          }
-        >
-          <StatusBox
-            label="Working"
-            value={
-              workingTeamCount
-            }
-            type="working"
-          />
+            <BreakdownRow
+              label="Promo"
+              value={formatMinutes(
+                promoMinutes
+              )}
+            />
 
-          <StatusBox
-            label="Sick"
-            value={
-              sickCount
-            }
-            type="danger"
-          />
+            <BreakdownRow
+              label="Protect"
+              value={formatMinutes(
+                protectMinutes
+              )}
+            />
 
-          <StatusBox
-            label="Late"
-            value={
-              lateCount
-            }
-            type="warning"
-          />
-
-          <StatusBox
-            label="No Show"
-            value={
-              noShowCount
-            }
-            type="danger"
-          />
-        </View>
-
-        {calledInCount >
-          0 && (
-          <View
-            style={
-              styles.calledInSummary
-            }
-          >
-            <Text
-              style={
-                styles.calledInLabel
-              }
-            >
-              Called In / Extra
-            </Text>
-
-            <Text
-              style={
-                styles.calledInValue
-              }
-            >
-              {
-                calledInCount
-              }
-            </Text>
+            <BreakdownRow
+              label="Other / Organising"
+              value={formatMinutes(
+                organisingMinutes
+              )}
+              last
+            />
           </View>
         )}
 
-        <View
-          style={
-            styles.sectionHeader
-          }
-        >
-          <Text
-            style={
-              styles.sectionTitleNoMargin
-            }
-          >
-            Tonight&apos;s Team
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitleNoMargin}>
+            Team Status
           </Text>
 
-          <Text
-            style={
-              styles.teamCount
+          <TouchableOpacity
+            onPress={() =>
+              router.push('/week')
             }
           >
-            {
-              tonightRoster.length
-            }
-          </Text>
+            <Text style={styles.linkText}>
+              Roster
+            </Text>
+          </TouchableOpacity>
         </View>
 
-        {tonightRoster.map(
-          (entry) => {
-            const employee =
-              getEmployee(
-                entry.employeeId
-              );
+        {roster.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyTitle}>
+              No roster for {dayName}
+            </Text>
 
-            if (
-              !employee
-            ) {
-              return null;
-            }
+            <Text style={styles.emptyText}>
+              Add tonight’s team before calculating labour and allocation suggestions.
+            </Text>
+          </View>
+        ) : (
+          <View style={styles.teamCard}>
+            <View style={styles.teamStatsRow}>
+              <MiniStat
+                label="Working"
+                value={String(
+                  activeRoster.length
+                )}
+              />
 
-            const colors =
-              getStatusColor(
-                entry.status
-              );
+              <MiniStat
+                label="Sick"
+                value={String(sickCount)}
+                danger={sickCount > 0}
+              />
 
-            const initials =
-              employee.name
-                .split(' ')
-                .map(
-                  (part) =>
-                    part[0]
-                )
-                .join('')
-                .slice(
-                  0,
-                  2
-                )
-                .toUpperCase();
+              <MiniStat
+                label="Late"
+                value={String(lateCount)}
+                warning={lateCount > 0}
+              />
 
-            return (
-              <View
-                key={
-                  entry.employeeId
-                }
-                style={
-                  styles.teamCard
-                }
-              >
-                <View
-                  style={
-                    styles.avatar
-                  }
-                >
-                  <Text
-                    style={
-                      styles.avatarText
-                    }
-                  >
-                    {
-                      initials
-                    }
-                  </Text>
-                </View>
+              <MiniStat
+                label="Active Now"
+                value={String(
+                  activeNowCount
+                )}
+              />
+            </View>
 
-                <View
-                  style={
-                    styles.teamInfo
-                  }
-                >
-                  <Text
-                    style={
-                      styles.teamName
-                    }
-                  >
-                    {
-                      employee.name
-                    }
-                  </Text>
+            <View style={styles.divider} />
 
-                  <Text
-                    style={
-                      styles.teamSubtext
-                    }
-                  >
-                    {entry.startTime &&
-                    entry.finishTime
-                      ? `${formatClock(
-                          entry.startTime
-                        )} → ${formatClock(
-                          entry.finishTime
-                        )}`
-                      : entry.isExtra
-                        ? 'Extra / Called In'
-                        : 'Contracted'}
-                  </Text>
-                </View>
+            {roster.slice(0, 6).map(
+              (entry, index) => {
+                const employeeName =
+                  getEmployeeName(
+                    employees,
+                    entry.employeeId
+                  );
 
-                <View
-                  style={
-                    styles.teamRight
-                  }
-                >
+                const window =
+                  getShiftWindow(entry);
+
+                const rosterDuration =
+                  formatMinutes(
+                    window.durationMinutes
+                  );
+
+                return (
                   <View
+                    key={`${entry.employeeId}-${index}`}
                     style={[
-                      styles.statusBadge,
-                      {
-                        backgroundColor:
-                          colors.background,
-                      },
+                      styles.teamMemberRow,
+                      index ===
+                        Math.min(
+                          roster.length,
+                          6
+                        ) -
+                          1 &&
+                        styles.teamMemberRowLast,
                     ]}
                   >
-                    <Text
-                      style={[
-                        styles.statusBadgeText,
-                        {
-                          color:
-                            colors.text,
-                        },
-                      ]}
-                    >
-                      {
-                        entry.status
-                      }
-                    </Text>
+                    <View style={styles.teamMemberInfo}>
+                      <Text style={styles.teamMemberName}>
+                        {employeeName}
+                      </Text>
+
+                      <Text style={styles.teamMemberShift}>
+                        {entry.startTime &&
+                        entry.finishTime
+                          ? `${formatClock(
+                              entry.startTime
+                            )} → ${formatClock(
+                              entry.finishTime
+                            )}`
+                          : `${rosterDuration} rostered`}
+                      </Text>
+                    </View>
+
+                    <StatusPill
+                      status={entry.status}
+                    />
                   </View>
-                </View>
-              </View>
-            );
-          }
+                );
+              }
+            )}
+
+            {roster.length > 6 && (
+              <Text style={styles.moreTeamText}>
+                +{roster.length - 6} more team members in roster
+              </Text>
+            )}
+          </View>
         )}
 
-        <Text
-          style={
-            styles.sectionTitle
-          }
-        >
-          Grocery Operations
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitleNoMargin}>
+            Allocation
+          </Text>
+
+          <TouchableOpacity
+            onPress={() =>
+              router.push('/allocation')
+            }
+          >
+            <Text style={styles.linkText}>
+              Smart allocation
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.allocationCard}>
+          <View style={styles.allocationTopRow}>
+            <View>
+              <Text style={styles.cardLabel}>
+                FINAL MANAGER ALLOCATION
+              </Text>
+
+              <Text style={styles.allocationValue}>
+                {formatMinutes(
+                  allocatedMinutes
+                )}
+              </Text>
+            </View>
+
+            <View style={styles.allocationRight}>
+              <Text style={styles.allocationPercent}>
+                {allocationCoverage}%
+              </Text>
+
+              <Text style={styles.allocationPercentLabel}>
+                labour assigned
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.divider} />
+
+          <SummaryRow
+            label="Tasks fully covered"
+            value={`${fullyAllocatedTaskCount}/${tasks.length}`}
+          />
+
+          <SummaryRow
+            label="Load allocation difference"
+            value={
+              requiredMinutes > 0
+                ? formatSignedMinutes(
+                    allocationDifference
+                  )
+                : '—'
+            }
+            tone={
+              allocationDifference < 0
+                ? 'danger'
+                : 'good'
+            }
+          />
+
+          <View style={styles.inlineButtons}>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() =>
+                router.push('/allocation')
+              }
+            >
+              <Text style={styles.secondaryButtonText}>
+                Suggest / Edit
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() =>
+                router.push('/team-plan')
+              }
+            >
+              <Text style={styles.secondaryButtonText}>
+                Team Plan
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <Text style={styles.sectionTitle}>
+          Quick Actions
         </Text>
 
-        <OperationCard
-          icon="🚚"
-          title="Load Arrival"
-          subtitle="Record load arrival and calculate real labour"
-          onPress={() =>
-            router.push(
-              '/load-arrival'
-            )
-          }
-        />
+        <View style={styles.actionGrid}>
+          <ActionButton
+            title="Roster"
+            detail="Team & shifts"
+            onPress={() =>
+              router.push('/week')
+            }
+          />
 
-        <OperationCard
-          icon="👥"
-          title="Staff Allocation"
-          subtitle="Allocate remaining post-load labour"
-          onPress={() =>
-            router.push(
-              '/allocation'
-            )
-          }
-        />
+          <ActionButton
+            title="Load Arrival"
+            detail="Expected / actual"
+            onPress={() =>
+              router.push('/load-arrival')
+            }
+          />
 
-        <OperationCard
-          icon="📋"
-          title="Team Plan"
-          subtitle="View each employee's assigned tasks"
-          onPress={() =>
-            router.push(
-              '/team-plan'
-            )
-          }
-        />
+          <ActionButton
+            title="Smart Allocation"
+            detail="Suggest & edit"
+            onPress={() =>
+              router.push('/allocation')
+            }
+          />
 
-        <OperationCard
-          icon="⏱"
-          title="Live Progress"
-          subtitle="Track task completion and timing"
-          onPress={() =>
-            router.push(
-              '/live-progress'
-            )
-          }
-        />
+          <ActionButton
+            title="Team Plan"
+            detail="Planned timeline"
+            onPress={() =>
+              router.push('/team-plan')
+            }
+          />
 
-        <OperationCard
-          icon="📊"
-          title="Night Summary"
-          subtitle="Review labour, attendance and performance"
-          onPress={() =>
-            router.push(
-              '/night-summary'
-            )
-          }
-        />
+          <ActionButton
+            title="Live Progress"
+            detail="Track the night"
+            onPress={() =>
+              router.push('/live-progress')
+            }
+          />
+
+          <ActionButton
+            title="Night Summary"
+            detail="Close & report"
+            onPress={() =>
+              router.push('/night-summary')
+            }
+          />
+        </View>
+
+        {Object.keys(taskRequirementByName)
+          .length > 0 &&
+          allocations.length > 0 && (
+          <View style={styles.noteCard}>
+            <Text style={styles.noteTitle}>
+              One source of truth
+            </Text>
+
+            <Text style={styles.noteText}>
+              Tonight now uses the same shared engine as Allocation for overnight shifts, labour before the truck, post-arrival capacity and shortage / surplus.
+            </Text>
+          </View>
+        )}
       </ScrollView>
     </View>
   );
 }
 
-function OverviewCard({
+function WorkflowRow({
+  step,
+  title,
+  detail,
+  tone,
+  onPress,
+  last = false,
+}: {
+  step: string;
+  title: string;
+  detail: string;
+  tone: WorkflowTone;
+  onPress: () => void;
+  last?: boolean;
+}) {
+  const badgeStyle =
+    tone === 'done'
+      ? styles.workflowBadgeDone
+      : tone === 'active'
+        ? styles.workflowBadgeActive
+        : styles.workflowBadgeWaiting;
+
+  const badgeText =
+    tone === 'done'
+      ? '✓'
+      : step;
+
+  return (
+    <TouchableOpacity
+      style={[
+        styles.workflowRow,
+        last && styles.workflowRowLast,
+      ]}
+      onPress={onPress}
+    >
+      <View
+        style={[
+          styles.workflowBadge,
+          badgeStyle,
+        ]}
+      >
+        <Text style={styles.workflowBadgeText}>
+          {badgeText}
+        </Text>
+      </View>
+
+      <View style={styles.workflowInfo}>
+        <Text style={styles.workflowTitle}>
+          {title}
+        </Text>
+
+        <Text style={styles.workflowDetail}>
+          {detail}
+        </Text>
+      </View>
+
+      <Text style={styles.workflowArrow}>
+        ›
+      </Text>
+    </TouchableOpacity>
+  );
+}
+
+function SummaryRow({
   label,
   value,
-  valueStyle,
+  tone,
 }: {
   label: string;
   value: string;
-  valueStyle?: any;
+  tone?:
+    | 'primary'
+    | 'good'
+    | 'danger'
+    | 'warning';
+}) {
+  let valueStyle =
+    styles.summaryValue;
+
+  if (tone === 'primary') {
+    valueStyle =
+      styles.summaryPrimary;
+  }
+
+  if (tone === 'good') {
+    valueStyle =
+      styles.summaryGood;
+  }
+
+  if (tone === 'danger') {
+    valueStyle =
+      styles.summaryDanger;
+  }
+
+  if (tone === 'warning') {
+    valueStyle =
+      styles.summaryWarning;
+  }
+
+  return (
+    <View style={styles.summaryRow}>
+      <Text style={styles.summaryLabel}>
+        {label}
+      </Text>
+
+      <Text style={valueStyle}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function MetricTile({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: string;
+  sub: string;
+}) {
+  return (
+    <View style={styles.metricTile}>
+      <Text style={styles.metricLabel}>
+        {label}
+      </Text>
+
+      <Text style={styles.metricValue}>
+        {value}
+      </Text>
+
+      <Text style={styles.metricSub}>
+        {sub}
+      </Text>
+    </View>
+  );
+}
+
+function BreakdownRow({
+  label,
+  value,
+  accent = false,
+  last = false,
+}: {
+  label: string;
+  value: string;
+  accent?: boolean;
+  last?: boolean;
 }) {
   return (
     <View
-      style={
-        styles.overviewCard
-      }
+      style={[
+        styles.breakdownRow,
+        last && styles.breakdownRowLast,
+      ]}
     >
+      <Text style={styles.breakdownLabel}>
+        {label}
+      </Text>
+
       <Text
         style={
-          styles.overviewLabel
+          accent
+            ? styles.breakdownAccent
+            : styles.breakdownValue
         }
       >
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function MiniStat({
+  label,
+  value,
+  danger = false,
+  warning = false,
+}: {
+  label: string;
+  value: string;
+  danger?: boolean;
+  warning?: boolean;
+}) {
+  return (
+    <View style={styles.miniStat}>
+      <Text style={styles.miniStatLabel}>
         {label}
       </Text>
 
       <Text
         style={[
-          styles.overviewValue,
-          valueStyle,
+          styles.miniStatValue,
+          danger &&
+            styles.miniStatDanger,
+          warning &&
+            styles.miniStatWarning,
         ]}
       >
         {value}
@@ -2193,871 +1465,665 @@ function OverviewCard({
   );
 }
 
-function SummaryRow({
-  label,
-  value,
-  highlight = false,
+function StatusPill({
+  status,
 }: {
-  label: string;
-  value: string;
-  highlight?: boolean;
+  status: PlanningRosterEntry['status'];
 }) {
+  const danger =
+    status === 'Sick' ||
+    status === 'No Show';
+
+  const warning =
+    status === 'Late' ||
+    status === 'Left Early';
+
   return (
     <View
-      style={
-        styles.loadSummaryRow
-      }
+      style={[
+        styles.statusPill,
+        danger && styles.statusPillDanger,
+        warning &&
+          styles.statusPillWarning,
+      ]}
     >
       <Text
-        style={
-          styles.loadSummaryLabel
-        }
+        style={[
+          styles.statusPillText,
+          danger &&
+            styles.statusPillTextDanger,
+          warning &&
+            styles.statusPillTextWarning,
+        ]}
       >
-        {label}
-      </Text>
-
-      <Text
-        style={
-          highlight
-            ? styles.splittingText
-            : styles.loadSummaryValue
-        }
-      >
-        {value}
+        {status}
       </Text>
     </View>
   );
 }
 
-function StatusBox({
-  label,
-  value,
-  type,
-}: {
-  label: string;
-  value: number;
-  type:
-    | 'working'
-    | 'danger'
-    | 'warning';
-}) {
-  let style =
-    styles.statusWorking;
-
-  if (
-    type ===
-    'danger'
-  ) {
-    style =
-      styles.statusSick;
-  }
-
-  if (
-    type ===
-    'warning'
-  ) {
-    style =
-      styles.statusLate;
-  }
-
-  return (
-    <View
-      style={
-        styles.statusStat
-      }
-    >
-      <Text
-        style={
-          styles.statusStatLabel
-        }
-      >
-        {label}
-      </Text>
-
-      <Text
-        style={
-          style
-        }
-      >
-        {value}
-      </Text>
-    </View>
-  );
-}
-
-function OperationCard({
-  icon,
+function ActionButton({
   title,
-  subtitle,
+  detail,
   onPress,
 }: {
-  icon: string;
   title: string;
-  subtitle: string;
+  detail: string;
   onPress: () => void;
 }) {
   return (
     <TouchableOpacity
-      style={
-        styles.menuCard
-      }
-      activeOpacity={
-        0.7
-      }
-      onPress={
-        onPress
-      }
+      style={styles.actionButton}
+      onPress={onPress}
     >
-      <View
-        style={
-          styles.menuIcon
-        }
-      >
-        <Text
-          style={
-            styles.menuEmoji
-          }
-        >
-          {icon}
-        </Text>
-      </View>
+      <Text style={styles.actionTitle}>
+        {title}
+      </Text>
 
-      <View
-        style={
-          styles.menuContent
-        }
-      >
-        <Text
-          style={
-            styles.menuTitle
-          }
-        >
-          {title}
-        </Text>
+      <Text style={styles.actionDetail}>
+        {detail}
+      </Text>
 
-        <Text
-          style={
-            styles.menuSubtitle
-          }
-        >
-          {subtitle}
-        </Text>
-      </View>
-
-      <Text
-        style={
-          styles.arrow
-        }
-      >
-        ›
+      <Text style={styles.actionArrow}>
+        →
       </Text>
     </TouchableOpacity>
   );
 }
 
-const styles =
-  StyleSheet.create({
-    container: {
-      flex: 1,
-      backgroundColor:
-        '#F4F6FA',
-    },
-
-    header: {
-      backgroundColor:
-        '#101D48',
-      paddingTop: 65,
-      paddingHorizontal: 22,
-      paddingBottom: 25,
-    },
-
-    smallTitle: {
-      color:
-        '#AEB9DD',
-      fontSize: 12,
-      fontWeight:
-        '700',
-      letterSpacing: 2,
-    },
-
-    title: {
-      color:
-        '#FFFFFF',
-      fontSize: 34,
-      fontWeight:
-        '800',
-      marginTop: 6,
-    },
-
-    date: {
-      color:
-        '#D5DBED',
-      fontSize: 13,
-      marginTop: 5,
-    },
-
-    nightLabel: {
-      color:
-        '#AEB9DD',
-      fontSize: 10,
-      marginTop: 5,
-    },
-
-    content: {
-      padding: 16,
-      paddingBottom: 55,
-    },
-
-    sectionTitle: {
-      color:
-        '#101828',
-      fontSize: 17,
-      fontWeight:
-        '800',
-      marginTop: 22,
-      marginBottom: 9,
-    },
-
-    sectionTitleNoMargin: {
-      color:
-        '#101828',
-      fontSize: 17,
-      fontWeight:
-        '800',
-    },
-
-    realTimeCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 16,
-      padding: 15,
-      borderWidth: 1,
-      borderColor:
-        '#DCEFE4',
-    },
-
-    realTimeTop: {
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-      alignItems:
-        'center',
-    },
-
-    realTimeLabel: {
-      color:
-        '#98A2B3',
-      fontSize: 8,
-      fontWeight:
-        '800',
-    },
-
-    waitingText: {
-      color:
-        '#B54708',
-      fontSize: 15,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    arrivedText: {
-      color:
-        '#168455',
-      fontSize: 15,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    realTimeStats: {
-      flexDirection:
-        'row',
-      marginTop: 14,
-      backgroundColor:
-        '#F8F9FB',
-      borderRadius: 11,
-      paddingVertical: 10,
-    },
-
-    realTimeStat: {
-      flex: 1,
-      alignItems:
-        'center',
-    },
-
-    realTimeDivider: {
-      width: 1,
-      height: 30,
-      backgroundColor:
-        '#EAECF0',
-    },
-
-    realTimeStatLabel: {
-      color:
-        '#98A2B3',
-      fontSize: 7,
-    },
-
-    onShiftNumber: {
-      color:
-        '#168455',
-      fontSize: 17,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    laterNumber: {
-      color:
-        '#B54708',
-      fontSize: 17,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    finishedNumber: {
-      color:
-        '#667085',
-      fontSize: 17,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    realLabourCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 15,
-      padding: 15,
-    },
-
-    realLabourRow: {
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-      alignItems:
-        'center',
-      paddingVertical: 7,
-    },
-
-    realLabourLabel: {
-      color:
-        '#667085',
-      fontSize: 10,
-    },
-
-    realLabourStrongLabel: {
-      color:
-        '#101828',
-      fontSize: 10,
-      fontWeight:
-        '800',
-    },
-
-    realLabourValue: {
-      color:
-        '#101D48',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    preLoadValue: {
-      color:
-        '#B54708',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    postArrivalValue: {
-      color:
-        '#2436B2',
-      fontSize: 15,
-      fontWeight:
-        '800',
-    },
-
-    realLabourDivider: {
-      height: 1,
-      backgroundColor:
-        '#EAECF0',
-      marginVertical: 5,
-    },
-
-    realDifferenceBox: {
-      marginTop: 10,
-      borderRadius: 11,
-      padding: 12,
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-      alignItems:
-        'center',
-    },
-
-    shortageBox: {
-      backgroundColor:
-        '#FDECEC',
-    },
-
-    surplusBox: {
-      backgroundColor:
-        '#E8F8EF',
-    },
-
-    realDifferenceLabel: {
-      color:
-        '#667085',
-      fontSize: 8,
-      fontWeight:
-        '800',
-    },
-
-    realDifferenceValue: {
-      fontSize: 15,
-      fontWeight:
-        '800',
-    },
-
-    scanButton: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 16,
-      padding: 15,
-      flexDirection:
-        'row',
-      alignItems:
-        'center',
-      marginTop: 10,
-    },
-
-    cameraBox: {
-      width: 48,
-      height: 48,
-      borderRadius: 14,
-      backgroundColor:
-        '#E9ECFF',
-      alignItems:
-        'center',
-      justifyContent:
-        'center',
-    },
-
-    cameraIcon: {
-      fontSize: 22,
-    },
-
-    scanContent: {
-      flex: 1,
-      marginLeft: 12,
-    },
-
-    scanTitle: {
-      color:
-        '#101D48',
-      fontSize: 15,
-      fontWeight:
-        '800',
-    },
-
-    scanSubtitle: {
-      color:
-        '#667085',
-      fontSize: 9,
-      marginTop: 3,
-    },
-
-    arrow: {
-      color:
-        '#98A2B3',
-      fontSize: 27,
-    },
-
-    overviewGrid: {
-      flexDirection:
-        'row',
-      flexWrap:
-        'wrap',
-      gap: 9,
-    },
-
-    overviewCard: {
-      width:
-        '48.5%',
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 14,
-      padding: 14,
-    },
-
-    overviewLabel: {
-      color:
-        '#667085',
-      fontSize: 10,
-    },
-
-    overviewValue: {
-      color:
-        '#101D48',
-      fontSize: 20,
-      fontWeight:
-        '800',
-      marginTop: 7,
-    },
-
-    shortageText: {
-      color:
-        '#D92D20',
-    },
-
-    surplusText: {
-      color:
-        '#168455',
-    },
-
-    loadSummaryCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 14,
-      padding: 15,
-      gap: 11,
-    },
-
-    loadSummaryRow: {
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-      alignItems:
-        'center',
-    },
-
-    loadSummaryLabel: {
-      color:
-        '#667085',
-      fontSize: 10,
-    },
-
-    loadSummaryValue: {
-      color:
-        '#101D48',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    splittingText: {
-      color:
-        '#6D5DFB',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    planSummaryCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 14,
-      padding: 14,
-      flexDirection:
-        'row',
-      alignItems:
-        'center',
-    },
-
-    planStat: {
-      flex: 1,
-      alignItems:
-        'center',
-    },
-
-    planDivider: {
-      width: 1,
-      height: 34,
-      backgroundColor:
-        '#EAECF0',
-    },
-
-    planStatLabel: {
-      color:
-        '#98A2B3',
-      fontSize: 8,
-    },
-
-    planStatValue: {
-      color:
-        '#101D48',
-      fontSize: 14,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    planRemaining: {
-      color:
-        '#168455',
-      fontSize: 14,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    liveStatusCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 14,
-      padding: 14,
-      flexDirection:
-        'row',
-      alignItems:
-        'center',
-    },
-
-    liveStatusItem: {
-      flex: 1,
-    },
-
-    liveStatusDivider: {
-      width: 1,
-      height: 34,
-      backgroundColor:
-        '#EAECF0',
-      marginHorizontal: 12,
-    },
-
-    liveStatusLabel: {
-      color:
-        '#98A2B3',
-      fontSize: 8,
-    },
-
-    liveCompleteValue: {
-      color:
-        '#168455',
-      fontSize: 17,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    liveProgressValue: {
-      color:
-        '#B54708',
-      fontSize: 17,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    statusSummary: {
-      flexDirection:
-        'row',
-      gap: 7,
-    },
-
-    statusStat: {
-      flex: 1,
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 11,
-      padding: 10,
-    },
-
-    statusStatLabel: {
-      color:
-        '#98A2B3',
-      fontSize: 8,
-    },
-
-    statusWorking: {
-      color:
-        '#168455',
-      fontSize: 18,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    statusSick: {
-      color:
-        '#D92D20',
-      fontSize: 18,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    statusLate: {
-      color:
-        '#B54708',
-      fontSize: 18,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    calledInSummary: {
-      backgroundColor:
-        '#E8F8EF',
-      borderRadius: 12,
-      padding: 12,
-      marginTop: 8,
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-    },
-
-    calledInLabel: {
-      color:
-        '#168455',
-      fontSize: 10,
-    },
-
-    calledInValue: {
-      color:
-        '#168455',
-      fontSize: 16,
-      fontWeight:
-        '800',
-    },
-
-    sectionHeader: {
-      marginTop: 22,
-      marginBottom: 9,
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-    },
-
-    teamCount: {
-      color:
-        '#2436B2',
-      fontWeight:
-        '800',
-    },
-
-    teamCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 14,
-      padding: 12,
-      marginBottom: 8,
-      flexDirection:
-        'row',
-      alignItems:
-        'center',
-    },
-
-    avatar: {
-      width: 42,
-      height: 42,
-      borderRadius: 13,
-      backgroundColor:
-        '#E9ECFF',
-      alignItems:
-        'center',
-      justifyContent:
-        'center',
-    },
-
-    avatarText: {
-      color:
-        '#2436B2',
-      fontSize: 12,
-      fontWeight:
-        '800',
-    },
-
-    teamInfo: {
-      flex: 1,
-      marginLeft: 11,
-    },
-
-    teamName: {
-      color:
-        '#101828',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    teamSubtext: {
-      color:
-        '#667085',
-      fontSize: 9,
-      marginTop: 3,
-    },
-
-    teamRight: {
-      alignItems:
-        'flex-end',
-    },
-
-    statusBadge: {
-      borderRadius: 7,
-      paddingHorizontal: 7,
-      paddingVertical: 4,
-    },
-
-    statusBadgeText: {
-      fontSize: 8,
-      fontWeight:
-        '800',
-    },
-
-    menuCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 14,
-      padding: 14,
-      marginBottom: 8,
-      flexDirection:
-        'row',
-      alignItems:
-        'center',
-    },
-
-    menuIcon: {
-      width: 42,
-      height: 42,
-      borderRadius: 12,
-      backgroundColor:
-        '#F2F4F7',
-      alignItems:
-        'center',
-      justifyContent:
-        'center',
-    },
-
-    menuEmoji: {
-      fontSize: 19,
-    },
-
-    menuContent: {
-      flex: 1,
-      marginLeft: 11,
-    },
-
-    menuTitle: {
-      color:
-        '#101828',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    menuSubtitle: {
-      color:
-        '#667085',
-      fontSize: 9,
-      marginTop: 3,
-    },
-  });
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#F4F6FA',
+  },
+
+  center: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#F4F6FA',
+  },
+
+  loadingText: {
+    color: '#667085',
+    fontSize: 13,
+  },
+
+  header: {
+    backgroundColor: '#101D48',
+    paddingTop: 66,
+    paddingHorizontal: 22,
+    paddingBottom: 24,
+  },
+
+  eyebrow: {
+    color: '#AEB9DD',
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1.5,
+  },
+
+  title: {
+    color: '#FFFFFF',
+    fontSize: 32,
+    fontWeight: '800',
+    marginTop: 4,
+  },
+
+  subtitle: {
+    color: '#D5DBED',
+    fontSize: 12,
+    marginTop: 5,
+  },
+
+  dateKeyText: {
+    color: '#8290BB',
+    fontSize: 9,
+    marginTop: 5,
+  },
+
+  content: {
+    padding: 16,
+    paddingBottom: 60,
+  },
+
+  heroCard: {
+    borderRadius: 18,
+    padding: 18,
+  },
+
+  heroPrimary: {
+    backgroundColor: '#2436B2',
+  },
+
+  heroDanger: {
+    backgroundColor: '#B42318',
+  },
+
+  heroKicker: {
+    color: '#D7DDFE',
+    fontSize: 8,
+    fontWeight: '800',
+    letterSpacing: 1.1,
+  },
+
+  heroTitle: {
+    color: '#FFFFFF',
+    fontSize: 22,
+    fontWeight: '800',
+    marginTop: 6,
+  },
+
+  heroSubtitle: {
+    color: '#EEF1FF',
+    fontSize: 10,
+    lineHeight: 16,
+    marginTop: 6,
+  },
+
+  heroFooter: {
+    marginTop: 15,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.2)',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+
+  heroFooterLabel: {
+    color: '#D7DDFE',
+    fontSize: 9,
+  },
+
+  heroFooterValue: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  sectionTitle: {
+    color: '#101828',
+    fontSize: 17,
+    fontWeight: '800',
+    marginTop: 21,
+    marginBottom: 9,
+  },
+
+  sectionTitleNoMargin: {
+    color: '#101828',
+    fontSize: 17,
+    fontWeight: '800',
+  },
+
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 21,
+    marginBottom: 9,
+  },
+
+  linkText: {
+    color: '#2436B2',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+
+  workflowCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    paddingHorizontal: 14,
+  },
+
+  workflowRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 13,
+    borderBottomWidth: 1,
+    borderBottomColor: '#EAECF0',
+  },
+
+  workflowRowLast: {
+    borderBottomWidth: 0,
+  },
+
+  workflowBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  workflowBadgeDone: {
+    backgroundColor: '#E8F8EF',
+  },
+
+  workflowBadgeActive: {
+    backgroundColor: '#E9ECFF',
+  },
+
+  workflowBadgeWaiting: {
+    backgroundColor: '#F2F4F7',
+  },
+
+  workflowBadgeText: {
+    color: '#2436B2',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+
+  workflowInfo: {
+    flex: 1,
+    marginLeft: 11,
+  },
+
+  workflowTitle: {
+    color: '#101828',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  workflowDetail: {
+    color: '#667085',
+    fontSize: 9,
+    marginTop: 3,
+  },
+
+  workflowArrow: {
+    color: '#98A2B3',
+    fontSize: 22,
+  },
+
+  labourCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 14,
+  },
+
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 6,
+  },
+
+  summaryLabel: {
+    color: '#667085',
+    fontSize: 10,
+    flex: 1,
+    paddingRight: 10,
+  },
+
+  summaryValue: {
+    color: '#101D48',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+
+  summaryPrimary: {
+    color: '#2436B2',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+
+  summaryGood: {
+    color: '#168455',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+
+  summaryDanger: {
+    color: '#D92D20',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+
+  summaryWarning: {
+    color: '#B54708',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+
+  divider: {
+    height: 1,
+    backgroundColor: '#EAECF0',
+    marginVertical: 6,
+  },
+
+  coverageTrack: {
+    height: 7,
+    backgroundColor: '#EAECF0',
+    borderRadius: 999,
+    overflow: 'hidden',
+    marginTop: 9,
+  },
+
+  coverageFill: {
+    height: '100%',
+    backgroundColor: '#2436B2',
+    borderRadius: 999,
+  },
+
+  coverageText: {
+    color: '#667085',
+    fontSize: 8,
+    lineHeight: 12,
+    marginTop: 6,
+  },
+
+  metricGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+
+  metricTile: {
+    width: '48.5%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 13,
+  },
+
+  metricLabel: {
+    color: '#667085',
+    fontSize: 9,
+  },
+
+  metricValue: {
+    color: '#101D48',
+    fontSize: 20,
+    fontWeight: '800',
+    marginTop: 5,
+  },
+
+  metricSub: {
+    color: '#98A2B3',
+    fontSize: 8,
+    marginTop: 3,
+  },
+
+  emptyCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 16,
+  },
+
+  emptyTitle: {
+    color: '#101828',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+
+  emptyText: {
+    color: '#667085',
+    fontSize: 9,
+    lineHeight: 15,
+    marginTop: 5,
+  },
+
+  primaryButton: {
+    backgroundColor: '#2436B2',
+    borderRadius: 11,
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 13,
+  },
+
+  primaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+
+  breakdownCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    paddingHorizontal: 14,
+  },
+
+  breakdownRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 11,
+    borderBottomWidth: 1,
+    borderBottomColor: '#EAECF0',
+  },
+
+  breakdownRowLast: {
+    borderBottomWidth: 0,
+  },
+
+  breakdownLabel: {
+    color: '#667085',
+    fontSize: 10,
+  },
+
+  breakdownValue: {
+    color: '#101D48',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  breakdownAccent: {
+    color: '#6D5DFB',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  teamCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 14,
+  },
+
+  teamStatsRow: {
+    flexDirection: 'row',
+  },
+
+  miniStat: {
+    flex: 1,
+    alignItems: 'center',
+  },
+
+  miniStatLabel: {
+    color: '#98A2B3',
+    fontSize: 8,
+  },
+
+  miniStatValue: {
+    color: '#101D48',
+    fontSize: 16,
+    fontWeight: '800',
+    marginTop: 3,
+  },
+
+  miniStatDanger: {
+    color: '#D92D20',
+  },
+
+  miniStatWarning: {
+    color: '#B54708',
+  },
+
+  teamMemberRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 9,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F2F4F7',
+  },
+
+  teamMemberRowLast: {
+    borderBottomWidth: 0,
+  },
+
+  teamMemberInfo: {
+    flex: 1,
+  },
+
+  teamMemberName: {
+    color: '#101828',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+
+  teamMemberShift: {
+    color: '#667085',
+    fontSize: 8,
+    marginTop: 2,
+  },
+
+  statusPill: {
+    backgroundColor: '#E8F8EF',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+
+  statusPillDanger: {
+    backgroundColor: '#FDECEC',
+  },
+
+  statusPillWarning: {
+    backgroundColor: '#FFF4E5',
+  },
+
+  statusPillText: {
+    color: '#168455',
+    fontSize: 7,
+    fontWeight: '800',
+  },
+
+  statusPillTextDanger: {
+    color: '#D92D20',
+  },
+
+  statusPillTextWarning: {
+    color: '#B54708',
+  },
+
+  moreTeamText: {
+    color: '#667085',
+    fontSize: 8,
+    textAlign: 'center',
+    marginTop: 9,
+  },
+
+  allocationCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 14,
+  },
+
+  allocationTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+
+  cardLabel: {
+    color: '#98A2B3',
+    fontSize: 8,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+  },
+
+  allocationValue: {
+    color: '#101D48',
+    fontSize: 23,
+    fontWeight: '800',
+    marginTop: 4,
+  },
+
+  allocationRight: {
+    alignItems: 'flex-end',
+  },
+
+  allocationPercent: {
+    color: '#2436B2',
+    fontSize: 19,
+    fontWeight: '800',
+  },
+
+  allocationPercentLabel: {
+    color: '#98A2B3',
+    fontSize: 7,
+    marginTop: 2,
+  },
+
+  inlineButtons: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 11,
+  },
+
+  secondaryButton: {
+    flex: 1,
+    backgroundColor: '#EEF1FF',
+    borderRadius: 10,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+
+  secondaryButtonText: {
+    color: '#2436B2',
+    fontSize: 9,
+    fontWeight: '800',
+  },
+
+  actionGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+
+  actionButton: {
+    width: '48.5%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 13,
+    minHeight: 92,
+  },
+
+  actionTitle: {
+    color: '#101828',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+
+  actionDetail: {
+    color: '#667085',
+    fontSize: 8,
+    marginTop: 4,
+  },
+
+  actionArrow: {
+    color: '#2436B2',
+    fontSize: 16,
+    fontWeight: '800',
+    marginTop: 'auto',
+  },
+
+  noteCard: {
+    backgroundColor: '#EEF1FF',
+    borderRadius: 14,
+    padding: 13,
+    marginTop: 20,
+  },
+
+  noteTitle: {
+    color: '#2436B2',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+
+  noteText: {
+    color: '#475467',
+    fontSize: 8,
+    lineHeight: 13,
+    marginTop: 4,
+  },
+});
