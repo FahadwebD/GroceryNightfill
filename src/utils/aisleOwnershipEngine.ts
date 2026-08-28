@@ -51,6 +51,7 @@ export type OwnershipResult = {
 
 const AISLE_STRETCH_MINUTES = 30;
 const COMPACT_LOAD_MINUTES = 4 * 60;
+const MAX_SPLITTERS = 3;
 
 function aisleSkill(employee: OwnershipEmployee | undefined, taskName: string) {
   if (!taskName.startsWith('Aisle ')) return 0;
@@ -217,19 +218,33 @@ export function buildAisleOwnershipPlan({
   }
 
   /*
-   * Splitting is shared because it is a team activity.
+   * Splitting is shared, but only three people are assigned as splitters.
+   * The three with the strongest remaining post-load capacity are selected,
+   * with earlier shift starts used as the tie-breaker. Their splitting labour
+   * is balanced in 15-minute chunks before aisle ownership is assigned.
    */
   const splitting = orderedTasks.find((task) => task.type === 'splitting');
   if (splitting && activeRoster.length > 0) {
     let remaining = splitting.requiredMinutes;
-    const candidates = [...activeRoster].sort((a, b) => {
-      const aAvailable = employeeAvailableMinutes[a.employeeId] || 0;
-      const bAvailable = employeeAvailableMinutes[b.employeeId] || 0;
-      return bAvailable - aAvailable;
-    });
+    const candidates = [...activeRoster]
+      .sort((a, b) => {
+        const aAvailable = employeeAvailableMinutes[a.employeeId] || 0;
+        const bAvailable = employeeAvailableMinutes[b.employeeId] || 0;
+
+        if (aAvailable !== bAvailable) {
+          return bAvailable - aAvailable;
+        }
+
+        return (
+          getShiftWindow(a).startMinute -
+          getShiftWindow(b).startMinute
+        );
+      })
+      .slice(0, MAX_SPLITTERS);
 
     while (remaining > 0) {
       let changed = false;
+
       for (const entry of candidates) {
         if (remaining <= 0) break;
 
@@ -258,7 +273,10 @@ export function buildAisleOwnershipPlan({
           managerHelpMinutes: 0,
           skillRating: 0,
           aisleOwner: false,
-          reason: 'Shared splitting before aisle ownership',
+          reason: `Splitter ${candidates.indexOf(entry) + 1}/${Math.min(
+            MAX_SPLITTERS,
+            candidates.length
+          )} · max ${MAX_SPLITTERS} splitters at a time`,
         });
         employeeAssignedMinutes[entry.employeeId] = projected;
         remaining -= share;
@@ -315,7 +333,7 @@ export function buildAisleOwnershipPlan({
       (employeeAisleCount[candidate.employeeId] || 0) + 1;
   }
 
-  /* Promo / Protect / Other go to the best remaining-fit employee. */
+  /* Organising goes to the best remaining-fit employee. */
   for (const task of orderedTasks.filter(
     (item) => item.type !== 'aisle' && item.type !== 'splitting'
   )) {
@@ -376,3 +394,4 @@ export function buildAisleOwnershipPlan({
 }
 
 export const AISLE_OWNERSHIP_STRETCH_MINUTES = AISLE_STRETCH_MINUTES;
+export const MAX_SPLITTERS_AT_A_TIME = MAX_SPLITTERS;
