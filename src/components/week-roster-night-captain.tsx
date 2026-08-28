@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useFocusEffect } from 'expo-router';
+import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
 import {
   Alert,
@@ -11,6 +11,13 @@ import {
   View,
 } from 'react-native';
 
+import {
+  getNightCaptainConfig,
+  isNightCaptainActive,
+  NIGHT_CAPTAIN_DAYS,
+  NIGHT_CAPTAIN_ID,
+  type NightCaptainConfig,
+} from '../utils/nightCaptainConfig';
 import { getDateKey, getNightfillDate } from '../utils/nightfillPlanning';
 import {
   NIGHTFILL_STORAGE,
@@ -51,15 +58,7 @@ type RosterEntry = {
 
 type SavedRoster = Record<string, RosterEntry[]>;
 
-const weekDays = [
-  'Monday',
-  'Tuesday',
-  'Wednesday',
-  'Thursday',
-  'Friday',
-  'Saturday',
-  'Sunday',
-] as const;
+const weekDays = [...NIGHT_CAPTAIN_DAYS];
 
 const statusOptions: ShiftStatus[] = [
   'Working',
@@ -68,26 +67,6 @@ const statusOptions: ShiftStatus[] = [
   'Left Early',
   'No Show',
 ];
-
-const NIGHT_CAPTAIN_ID = '__night_captain__';
-const NIGHT_CAPTAIN_START = '18:00';
-const NIGHT_CAPTAIN_FINISH = '03:00';
-const NIGHT_CAPTAIN_HOURS = '9.00';
-
-const NIGHT_CAPTAIN_EMPLOYEE: Employee = {
-  id: NIGHT_CAPTAIN_ID,
-  name: 'Night Captain',
-  employeeId: 'NIGHT-CAPTAIN',
-  employmentType: 'Night Captain',
-  contractDays: [],
-  dayHours: {},
-  weeklyContractHours: 45,
-  availableDays: [],
-  notes:
-    'System Night Captain role. Default shift 6:00 PM–3:00 AM. Five-day role; daily roster row is editable.',
-  createdAt: 'system',
-  aisleSkills: {},
-};
 
 function normaliseTime(value: string) {
   const text = value.trim();
@@ -114,7 +93,6 @@ function normaliseTime(value: string) {
 function calculateShiftMinutes(startValue: string, finishValue: string) {
   const start = normaliseTime(startValue);
   const finish = normaliseTime(finishValue);
-
   if (!start || !finish) return 0;
 
   const [startHour, startMinute] = start.split(':').map(Number);
@@ -122,7 +100,6 @@ function calculateShiftMinutes(startValue: string, finishValue: string) {
 
   const startTotal = startHour * 60 + startMinute;
   let finishTotal = finishHour * 60 + finishMinute;
-
   if (finishTotal <= startTotal) finishTotal += 24 * 60;
 
   const duration = finishTotal - startTotal;
@@ -137,7 +114,6 @@ function formatDuration(minutes: number) {
   const safe = Math.max(Math.round(minutes || 0), 0);
   const hours = Math.floor(safe / 60);
   const mins = safe % 60;
-
   if (hours === 0) return `${mins}m`;
   if (mins === 0) return `${hours}h`;
   return `${hours}h ${mins}m`;
@@ -146,7 +122,6 @@ function formatDuration(minutes: number) {
 function formatClock(value: string) {
   const time = normaliseTime(value);
   if (!time) return '—';
-
   const [hour, minute] = time.split(':').map(Number);
   const suffix = hour >= 12 ? 'PM' : 'AM';
   const hour12 = hour % 12 || 12;
@@ -156,7 +131,6 @@ function formatClock(value: string) {
 function createFinishTimeFromHours(startValue: string, hoursValue: string) {
   const start = normaliseTime(startValue);
   const hours = Number(hoursValue);
-
   if (!start || !hours || hours <= 0) return '';
 
   const [hour, minute] = start.split(':').map(Number);
@@ -185,21 +159,56 @@ function dateForWeekday(day: string) {
   return date;
 }
 
-function defaultNightCaptainEntry(): RosterEntry {
+function captainDefaultEntry(config: NightCaptainConfig): RosterEntry {
+  const minutes = calculateShiftMinutes(
+    config.defaultStartTime,
+    config.defaultFinishTime
+  );
+
   return {
     employeeId: NIGHT_CAPTAIN_ID,
-    hours: NIGHT_CAPTAIN_HOURS,
-    startTime: NIGHT_CAPTAIN_START,
-    finishTime: NIGHT_CAPTAIN_FINISH,
+    hours: minutesToHoursValue(minutes),
+    startTime: config.defaultStartTime,
+    finishTime: config.defaultFinishTime,
     status: 'Working',
     isExtra: false,
+  };
+}
+
+function captainEmployee(config: NightCaptainConfig): Employee {
+  const dayHours = Object.fromEntries(
+    config.activeDays.map((day) => [
+      day,
+      minutesToHoursValue(
+        calculateShiftMinutes(
+          config.defaultStartTime,
+          config.defaultFinishTime
+        )
+      ),
+    ])
+  );
+
+  return {
+    id: NIGHT_CAPTAIN_ID,
+    name: 'Night Captain',
+    employeeId: 'NIGHT-CAPTAIN',
+    employmentType: 'Night Captain',
+    contractDays: [...config.activeDays],
+    dayHours,
+    weeklyContractHours: 45,
+    availableDays: [],
+    notes:
+      'System Night Captain role. Five-day role target. Default nights and shift are manager-configurable.',
+    createdAt: 'system',
+    aisleSkills: {},
   };
 }
 
 function normaliseEntry(entry: RosterEntry, fallbackHours = '0'): RosterEntry {
   const startTime = entry.startTime || '17:00';
   const finishTime =
-    entry.finishTime || createFinishTimeFromHours(startTime, entry.hours || fallbackHours);
+    entry.finishTime ||
+    createFinishTimeFromHours(startTime, entry.hours || fallbackHours);
   const minutes = calculateShiftMinutes(startTime, finishTime);
 
   return {
@@ -223,77 +232,85 @@ export default function WeekRosterNightCaptainScreen() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [selectedDay, setSelectedDay] = useState(tonightDay);
   const [roster, setRoster] = useState<SavedRoster>({});
+  const [captainConfig, setCaptainConfig] = useState<NightCaptainConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [openStatusId, setOpenStatusId] = useState<string | null>(null);
 
   const selectedDate = useMemo(() => dateForWeekday(selectedDay), [selectedDay]);
   const selectedDateKey = useMemo(() => getDateKey(selectedDate), [selectedDate]);
 
-  async function seedNightCaptain(
+  async function seedCaptain(
     parsedEmployees: Employee[],
-    parsedRoster: SavedRoster
+    parsedRoster: SavedRoster,
+    config: NightCaptainConfig
   ) {
-    let employeeChanged = false;
-    let rosterChanged = false;
+    const existingCaptain = parsedEmployees.find(
+      (employee) => employee.id === NIGHT_CAPTAIN_ID
+    );
 
-    let nextEmployees = parsedEmployees;
+    const captain = captainEmployee(config);
 
-    if (!parsedEmployees.some((employee) => employee.id === NIGHT_CAPTAIN_ID)) {
-      nextEmployees = [...parsedEmployees, NIGHT_CAPTAIN_EMPLOYEE];
-      employeeChanged = true;
-    }
+    const nextEmployees = existingCaptain
+      ? parsedEmployees.map((employee) =>
+          employee.id === NIGHT_CAPTAIN_ID
+            ? { ...employee, ...captain, createdAt: employee.createdAt || 'system' }
+            : employee
+        )
+      : [...parsedEmployees, captain];
 
     const nextRoster: SavedRoster = { ...parsedRoster };
 
     for (const day of weekDays) {
       const dateKey = getDateKey(dateForWeekday(day));
       const source = nextRoster[dateKey] || nextRoster[day] || [];
-      const hasCaptain = source.some((entry) => entry.employeeId === NIGHT_CAPTAIN_ID);
+      const withoutCaptain = source.filter(
+        (entry) => entry.employeeId !== NIGHT_CAPTAIN_ID
+      );
+      const savedCaptain = source.find(
+        (entry) => entry.employeeId === NIGHT_CAPTAIN_ID
+      );
 
-      if (!hasCaptain) {
-        const withCaptain = [defaultNightCaptainEntry(), ...source];
-        nextRoster[dateKey] = withCaptain;
-        nextRoster[day] = withCaptain;
-        rosterChanged = true;
-      } else {
-        /* Keep the date record and weekday compatibility mirror aligned. */
-        if (!nextRoster[dateKey]) {
-          nextRoster[dateKey] = source;
-          rosterChanged = true;
-        }
-        if (!nextRoster[day]) {
-          nextRoster[day] = source;
-          rosterChanged = true;
-        }
-      }
+      const entries = isNightCaptainActive(config, day)
+        ? [
+            savedCaptain
+              ? normaliseEntry(
+                  savedCaptain,
+                  minutesToHoursValue(
+                    calculateShiftMinutes(
+                      config.defaultStartTime,
+                      config.defaultFinishTime
+                    )
+                  )
+                )
+              : captainDefaultEntry(config),
+            ...withoutCaptain,
+          ]
+        : withoutCaptain;
+
+      nextRoster[dateKey] = entries;
+      nextRoster[day] = entries;
     }
 
-    if (employeeChanged) {
-      await AsyncStorage.setItem('groceryEmployees', JSON.stringify(nextEmployees));
-    }
+    await AsyncStorage.setItem('groceryEmployees', JSON.stringify(nextEmployees));
+    await writeStorage(NIGHTFILL_STORAGE.roster, nextRoster);
 
-    if (rosterChanged) {
-      await writeStorage(NIGHTFILL_STORAGE.roster, nextRoster);
-    }
-
-    return {
-      employees: nextEmployees,
-      roster: nextRoster,
-    };
+    return { employees: nextEmployees, roster: nextRoster };
   }
 
   async function loadData() {
     try {
       setLoading(true);
 
-      const [parsedEmployees, parsedRoster] = await Promise.all([
+      const [parsedEmployees, parsedRoster, config] = await Promise.all([
         readStorage<Employee[]>('groceryEmployees', []),
         readStorage<SavedRoster>(NIGHTFILL_STORAGE.roster, {}),
+        getNightCaptainConfig(),
       ]);
 
-      const seeded = await seedNightCaptain(parsedEmployees, parsedRoster);
+      const seeded = await seedCaptain(parsedEmployees, parsedRoster, config);
       setEmployees(seeded.employees);
       setRoster(seeded.roster);
+      setCaptainConfig(config);
     } catch (error) {
       console.log('LOAD ROSTER ERROR:', error);
     } finally {
@@ -333,12 +350,17 @@ export default function WeekRosterNightCaptainScreen() {
     const savedEntries = roster[selectedDateKey] || roster[selectedDay] || [];
     const entries: RosterEntry[] = [];
 
-    const captain = savedEntries.find((entry) => entry.employeeId === NIGHT_CAPTAIN_ID);
-    entries.push(
-      captain
-        ? normaliseEntry(captain, NIGHT_CAPTAIN_HOURS)
-        : defaultNightCaptainEntry()
-    );
+    if (captainConfig && isNightCaptainActive(captainConfig, selectedDay)) {
+      const captain = savedEntries.find(
+        (entry) => entry.employeeId === NIGHT_CAPTAIN_ID
+      );
+
+      entries.push(
+        captain
+          ? normaliseEntry(captain)
+          : captainDefaultEntry(captainConfig)
+      );
+    }
 
     for (const employee of contractedEmployees) {
       const saved = savedEntries.find((entry) => entry.employeeId === employee.id);
@@ -368,7 +390,7 @@ export default function WeekRosterNightCaptainScreen() {
     }
 
     return entries;
-  }, [roster, selectedDateKey, selectedDay, contractedEmployees]);
+  }, [roster, selectedDateKey, selectedDay, contractedEmployees, captainConfig]);
 
   function getEmployee(employeeId: string) {
     return employees.find((employee) => employee.id === employeeId);
@@ -466,11 +488,14 @@ export default function WeekRosterNightCaptainScreen() {
   }
 
   async function resetNightCaptain() {
+    if (!captainConfig) return;
+
     const updated = currentRoster.map((entry) =>
       entry.employeeId === NIGHT_CAPTAIN_ID
-        ? defaultNightCaptainEntry()
+        ? captainDefaultEntry(captainConfig)
         : entry
     );
+
     await updateCurrentRoster(updated);
   }
 
@@ -527,6 +552,9 @@ export default function WeekRosterNightCaptainScreen() {
     ) + captainMinutes;
 
   const labourDifferenceMinutes = workingMinutes - originalContractMinutes;
+  const captainActive =
+    captainConfig?.enabled &&
+    isNightCaptainActive(captainConfig, selectedDay);
 
   async function manualSave() {
     const invalid = workingEntries.find(
@@ -627,14 +655,30 @@ export default function WeekRosterNightCaptainScreen() {
 
         <View style={styles.captainInfo}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.captainInfoTitle}>Night Captain · default every day</Text>
+            <Text style={styles.captainInfoTitle}>
+              Night Captain · {captainActive ? 'working tonight' : 'off tonight'}
+            </Text>
             <Text style={styles.captainInfoText}>
-              Default 6:00 PM → 3:00 AM. The role is planned as 5 days / 45h, but the row appears on every night so you can change the two off-days or hours as needed.
+              {captainConfig
+                ? `${captainConfig.activeDays.length} nights selected · default ${formatClock(
+                    captainConfig.defaultStartTime
+                  )} → ${formatClock(captainConfig.defaultFinishTime)} · five-day role target.`
+                : 'Captain settings unavailable.'}
             </Text>
           </View>
-          <TouchableOpacity style={styles.resetButton} onPress={resetNightCaptain}>
-            <Text style={styles.resetButtonText}>Reset 6–3</Text>
-          </TouchableOpacity>
+          <View style={styles.captainActions}>
+            {captainActive ? (
+              <TouchableOpacity style={styles.resetButton} onPress={resetNightCaptain}>
+                <Text style={styles.resetButtonText}>Reset shift</Text>
+              </TouchableOpacity>
+            ) : null}
+            <TouchableOpacity
+              style={styles.configureButton}
+              onPress={() => router.push('/night-captain-settings')}
+            >
+              <Text style={styles.configureButtonText}>Configure</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <View style={styles.summaryCard}>
@@ -843,6 +887,7 @@ const styles = StyleSheet.create({
   },
   captainInfoTitle: { color: '#4C3BCF', fontSize: 12, fontWeight: '800' },
   captainInfoText: { color: '#5E5878', fontSize: 9, lineHeight: 14, marginTop: 3 },
+  captainActions: { gap: 6 },
   resetButton: {
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 10,
@@ -850,6 +895,13 @@ const styles = StyleSheet.create({
     borderRadius: 9,
   },
   resetButtonText: { color: '#4C3BCF', fontSize: 9, fontWeight: '800' },
+  configureButton: {
+    backgroundColor: '#6D5DFB',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 9,
+  },
+  configureButtonText: { color: '#FFFFFF', fontSize: 9, fontWeight: '800' },
   summaryCard: {
     backgroundColor: '#101D48',
     borderRadius: 14,
