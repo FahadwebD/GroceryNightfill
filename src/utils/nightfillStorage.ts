@@ -1,9 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import {
-    getDateKey,
-    getNightfillDate,
-    getNightfillDayName,
+  getDateKey,
+  getNightfillDate,
 } from './nightfillPlanning';
 
 /*
@@ -36,6 +35,17 @@ export const NIGHTFILL_STORAGE = {
 |--------------------------------------------------------------------------
 | DATE CONTEXT
 |--------------------------------------------------------------------------
+|
+| IMPORTANT:
+|
+| getNightfillDate() already moves 12:00 AM → 4:59 AM
+| back to the previous Nightfill date.
+|
+| Therefore dayName must be derived directly from that adjusted date.
+| Passing the adjusted date through getNightfillDayName() would apply the
+| overnight adjustment a second time before 5 AM.
+|
+|--------------------------------------------------------------------------
 */
 
 export function getTonightContext() {
@@ -51,8 +61,12 @@ export function getTonightContext() {
       ),
 
     dayName:
-      getNightfillDayName(
-        date
+      date.toLocaleDateString(
+        'en-AU',
+        {
+          weekday:
+            'long',
+        }
       ),
   };
 }
