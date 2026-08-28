@@ -63,6 +63,122 @@ export async function writeStorage<T>(
   await AsyncStorage.setItem(key, JSON.stringify(value));
 }
 
+/*
+ * Operational Nightfill scope:
+ * - Splitting
+ * - Grocery aisles
+ * - Other / Organising
+ *
+ * Promo and Protect may still be detected by Fill Assist/OCR, but they are
+ * not part of this app's Nightfill workload, allocation or labour target.
+ */
+function ignoredOperationalTaskName(value?: string | null) {
+  const name = (value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ');
+
+  return (
+    name === 'promo' ||
+    name === 'protect' ||
+    name === 'protect aisle' ||
+    name === 'protect - aisle'
+  );
+}
+
+function loadItemMinutes(item: unknown) {
+  if (!item || typeof item !== 'object') return 0;
+
+  const value = item as {
+    hours?: string | number;
+    minutes?: string | number;
+  };
+
+  return Math.max(
+    (Number(value.hours) || 0) * 60 +
+      (Number(value.minutes) || 0),
+    0
+  );
+}
+
+function normaliseOperationalLoad<T>(value: T): T {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+
+  const load = value as unknown as {
+    items?: Array<{
+      name?: string;
+      hours?: string | number;
+      minutes?: string | number;
+      [key: string]: unknown;
+    }>;
+    totalRequiredMinutes?: number;
+    promoMinutes?: number;
+    protectMinutes?: number;
+    splittingMinutes?: number;
+    otherOrganisingMinutes?: number;
+    [key: string]: unknown;
+  };
+
+  const rawItems = Array.isArray(load.items) ? load.items : [];
+  const ignoredItemMinutes = rawItems
+    .filter((item) => ignoredOperationalTaskName(item.name))
+    .reduce((total, item) => total + loadItemMinutes(item), 0);
+
+  const items = rawItems.filter(
+    (item) => !ignoredOperationalTaskName(item.name)
+  );
+
+  const separatelyDetectedIgnoredMinutes =
+    Math.max(Number(load.promoMinutes) || 0, 0) +
+    Math.max(Number(load.protectMinutes) || 0, 0);
+
+  /*
+   * Promo/Protect can appear both as OCR item rows and as dedicated totals.
+   * Use the larger representation so we remove them once, not twice.
+   */
+  const ignoredMinutes = Math.max(
+    ignoredItemMinutes,
+    separatelyDetectedIgnoredMinutes
+  );
+
+  const rawRequired = Math.max(
+    Number(load.totalRequiredMinutes) || 0,
+    0
+  );
+
+  const operationalComponentMinimum =
+    items.reduce((total, item) => total + loadItemMinutes(item), 0) +
+    Math.max(Number(load.splittingMinutes) || 0, 0) +
+    Math.max(Number(load.otherOrganisingMinutes) || 0, 0);
+
+  const adjustedRequired = Math.max(
+    rawRequired - ignoredMinutes,
+    operationalComponentMinimum,
+    0
+  );
+
+  return {
+    ...load,
+    items,
+    promoMinutes: 0,
+    protectMinutes: 0,
+    totalRequiredMinutes: Math.round(adjustedRequired),
+  } as T;
+}
+
+function normaliseOperationalAllocations<T>(value: T): T {
+  if (!Array.isArray(value)) return value;
+
+  return value.filter((item) => {
+    if (!item || typeof item !== 'object') return true;
+    const allocation = item as { taskName?: string };
+    return !ignoredOperationalTaskName(allocation.taskName);
+  }) as T;
+}
+
 export async function applyBreakRulesToRoster(
   roster: PlanningRosterEntry[]
 ) {
@@ -91,17 +207,39 @@ async function enrichNightValue<T>(
   value: T
 ): Promise<T> {
   if (
-    storageKey !== NIGHTFILL_STORAGE.roster ||
-    !Array.isArray(value)
+    storageKey === NIGHTFILL_STORAGE.roster &&
+    Array.isArray(value)
   ) {
-    return value;
+    const enriched = await applyBreakRulesToRoster(
+      value as PlanningRosterEntry[]
+    );
+    return enriched as T;
   }
 
-  const enriched = await applyBreakRulesToRoster(
-    value as PlanningRosterEntry[]
-  );
+  if (storageKey === NIGHTFILL_STORAGE.loads) {
+    return normaliseOperationalLoad(value);
+  }
 
-  return enriched as T;
+  if (storageKey === NIGHTFILL_STORAGE.allocations) {
+    return normaliseOperationalAllocations(value);
+  }
+
+  return value;
+}
+
+async function prepareNightValueForStorage<T>(
+  storageKey: string,
+  value: T
+): Promise<T> {
+  if (storageKey === NIGHTFILL_STORAGE.loads) {
+    return normaliseOperationalLoad(value);
+  }
+
+  if (storageKey === NIGHTFILL_STORAGE.allocations) {
+    return normaliseOperationalAllocations(value);
+  }
+
+  return value;
 }
 
 export async function readNightValue<T>(
@@ -150,7 +288,9 @@ async function auditNightSave(
       action: 'Fill Assist load saved',
       details: `${dateKey} · ${Math.round(
         load.totalRequiredMinutes || 0
-      )} labour min · ${Math.round(load.totalCartons || 0)} cartons`,
+      )} operational labour min · ${Math.round(
+        load.totalCartons || 0
+      )} cartons`,
     });
     return;
   }
@@ -177,9 +317,9 @@ async function auditNightSave(
       action: arrival.arrived
         ? 'Load arrival recorded'
         : 'Load arrival updated',
-      details: `${dateKey} · expected ${arrival.expectedTime || '—'} · actual ${
-        arrival.actualTime || '—'
-      }`,
+      details: `${dateKey} · expected ${
+        arrival.expectedTime || '—'
+      } · actual ${arrival.actualTime || '—'}`,
     });
     return;
   }
@@ -204,14 +344,19 @@ export async function saveNightValue<T>(
     {}
   );
 
-  record[dateKey] = value;
+  const storedValue = await prepareNightValueForStorage(
+    storageKey,
+    value
+  );
+
+  record[dateKey] = storedValue;
 
   if (legacyDayName) {
-    record[legacyDayName] = value;
+    record[legacyDayName] = storedValue;
   }
 
   await writeStorage(storageKey, record);
-  await auditNightSave(storageKey, dateKey, value);
+  await auditNightSave(storageKey, dateKey, storedValue);
 }
 
 export async function saveTonightValue<T>(
@@ -262,6 +407,7 @@ export async function migrateTonightLegacyData(
     NIGHTFILL_STORAGE.allocations,
     NIGHTFILL_STORAGE.progress,
     NIGHTFILL_STORAGE.arrivals,
+    NIGHTFILL_STORAGE.helpActions,
   ];
 
   let migratedCount = 0;
