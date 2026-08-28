@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: grocery-nightfill-api
+    runtime: node
+
+    buildCommand: npm install
+    startCommand: npm run server
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
