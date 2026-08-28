@@ -2,6 +2,7 @@ import { router, useFocusEffect } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useState } from 'react';
 import {
+  Alert,
   ScrollView,
   StyleSheet,
   Text,
@@ -12,6 +13,7 @@ import {
   hasManagerPin,
   requestManagerLock,
 } from '../utils/managerSecurity';
+import { seedProvidedWeeklyRoster } from '../utils/providedRosterSeed';
 
 export default function SettingsScreen() {
   const [pinEnabled, setPinEnabled] = useState(false);
@@ -21,6 +23,31 @@ export default function SettingsScreen() {
       hasManagerPin().then(setPinEnabled);
     }, [])
   );
+
+  function reimportProvidedRoster() {
+    Alert.alert(
+      'Re-import 7-Day Roster?',
+      'This will refresh the supplied Monday–Sunday roster in the local app database. Night Captain is preserved. Employee aisle skills and existing employee IDs are preserved when names match.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Import',
+          onPress: async () => {
+            try {
+              const result = await seedProvidedWeeklyRoster({ force: true });
+              Alert.alert(
+                'Roster Imported',
+                `${result.employeeCount} employees loaded.\n${result.partTimeCount} employees saved with 12h weekly contracts.\n${result.casualCount} employees work fewer than 3 days and were saved as casual.\nAvailability: all 7 days.`
+              );
+            } catch (error) {
+              console.log('REIMPORT PROVIDED ROSTER ERROR:', error);
+              Alert.alert('Import Failed', 'Could not refresh the supplied roster.');
+            }
+          },
+        },
+      ]
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -131,6 +158,14 @@ export default function SettingsScreen() {
         />
 
         <Text style={styles.sectionTitle}>Data</Text>
+
+        <SettingCard
+          title="Provided 7-Day Roster Database"
+          subtitle="Re-import the supplied Monday–Sunday roster, employee contracts and all-day availability"
+          onPress={reimportProvidedRoster}
+          badge="LOADED"
+          badgeTone="good"
+        />
 
         <SettingCard
           title="Export Nightfill Data"
