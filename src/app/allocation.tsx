@@ -1,1 +1,1 @@
-export { default } from '../components/recovery-allocation-capacity';
+export { default } from '../components/ownership-allocation';
