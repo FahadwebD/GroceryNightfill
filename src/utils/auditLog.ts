@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getTonightContext } from './nightfillStorage';
+import { getDateKey, getNightfillDate } from './nightfillPlanning';
 
 export const AUDIT_LOG_KEY = 'groceryNightAuditLog';
 
@@ -38,7 +38,7 @@ export async function appendAuditLog({
   try {
     const stored = await AsyncStorage.getItem(AUDIT_LOG_KEY);
     const current: AuditEntry[] = stored ? JSON.parse(stored) : [];
-    const { dateKey } = getTonightContext();
+    const dateKey = getDateKey(getNightfillDate());
 
     const next: AuditEntry[] = [
       {
