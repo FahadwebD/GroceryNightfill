@@ -90,6 +90,7 @@ export default function RootLayout() {
         <Tabs.Screen name="audit-log" options={{ href: null }} />
         <Tabs.Screen name="privacy-ai" options={{ href: null }} />
         <Tabs.Screen name="night-captain-settings" options={{ href: null }} />
+        <Tabs.Screen name="break-rules" options={{ href: null }} />
 
         <Tabs.Screen name="explore" options={{ href: null }} />
       </Tabs>
