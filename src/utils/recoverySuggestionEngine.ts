@@ -40,6 +40,7 @@ export type AllocationSuggestionResult = {
   employeeRemainingMinutes: Record<string, number>;
   employeeOverloadMinutes: Record<string, number>;
   recoveryMode: boolean;
+  compactMode: boolean;
   shortageMinutes: number;
   requiredPacePercent: number | null;
   paceMultiplier: number;
@@ -56,9 +57,12 @@ type Candidate = {
   assignedMinutes: number;
   remainingMinutes: number;
   loadRatio: number;
+  aisleCount: number;
 };
 
 const TARGET_CHUNK_MINUTES = 15;
+const SMALL_LOAD_LIMIT_MINUTES = 4 * 60;
+const SMALL_LOAD_STRETCH_MULTIPLIER = 1.15;
 
 function mergeAllocation(
   allocations: SuggestedAllocation[],
@@ -101,7 +105,8 @@ function buildCandidates(
   activeRoster: PlanningRosterEntry[],
   employeesById: Map<string, SuggestionEmployee>,
   capacityByEmployee: Record<string, number>,
-  assignedByEmployee: Record<string, number>
+  assignedByEmployee: Record<string, number>,
+  assignedAislesByEmployee: Record<string, Set<string>>
 ): Candidate[] {
   return activeRoster
     .map((entry) => {
@@ -131,6 +136,8 @@ function buildCandidates(
           capacityMinutes > 0
             ? assignedMinutes / capacityMinutes
             : 999,
+        aisleCount:
+          assignedAislesByEmployee[entry.employeeId]?.size || 0,
       };
     })
     .filter(
@@ -140,16 +147,81 @@ function buildCandidates(
     );
 }
 
-function candidateScore(task: SuggestionTask, candidate: Candidate) {
-  const skillScore = task.name.startsWith('Aisle ')
-    ? candidate.skillRating * 120
+function candidateScore(
+  task: SuggestionTask,
+  candidate: Candidate,
+  compactMode: boolean
+) {
+  const isAisle = task.name.startsWith('Aisle ');
+
+  const skillScore = isAisle
+    ? candidate.skillRating * (compactMode ? 80 : 120)
     : 0;
 
   const balanceScore = -candidate.loadRatio * 90;
   const remainingScore = candidate.remainingMinutes / 20;
   const earlierStartTieBreaker = -candidate.shiftStartMinute / 10000;
 
-  return skillScore + balanceScore + remainingScore + earlierStartTieBreaker;
+  let compactPairScore = 0;
+
+  if (compactMode && isAisle) {
+    /*
+     * For a light load, keep aisle ownership simple:
+     * - strongest preference: give a second aisle to someone who already has one
+     * - after two aisles, start looking at another suitable team member
+     *
+     * This avoids a small night producing one aisle per person when one person
+     * can reasonably own two aisles within their real remaining shift.
+     */
+    if (candidate.aisleCount === 1) {
+      compactPairScore = 250;
+    } else if (candidate.aisleCount === 0) {
+      compactPairScore = 60;
+    } else {
+      compactPairScore = -180 * (candidate.aisleCount - 1);
+    }
+  }
+
+  return (
+    skillScore +
+    balanceScore +
+    remainingScore +
+    compactPairScore +
+    earlierStartTieBreaker
+  );
+}
+
+function sortedCandidates(
+  task: SuggestionTask,
+  activeRoster: PlanningRosterEntry[],
+  employeesById: Map<string, SuggestionEmployee>,
+  capacityByEmployee: Record<string, number>,
+  assignedByEmployee: Record<string, number>,
+  assignedAislesByEmployee: Record<string, Set<string>>,
+  compactMode: boolean
+) {
+  return buildCandidates(
+    task,
+    activeRoster,
+    employeesById,
+    capacityByEmployee,
+    assignedByEmployee,
+    assignedAislesByEmployee
+  ).sort((a, b) => {
+    const scoreDifference =
+      candidateScore(task, b, compactMode) -
+      candidateScore(task, a, compactMode);
+
+    if (Math.abs(scoreDifference) > 0.0001) {
+      return scoreDifference;
+    }
+
+    if (a.shiftStartMinute !== b.shiftStartMinute) {
+      return a.shiftStartMinute - b.shiftStartMinute;
+    }
+
+    return a.name.localeCompare(b.name);
+  });
 }
 
 function chooseCandidate(
@@ -157,35 +229,30 @@ function chooseCandidate(
   activeRoster: PlanningRosterEntry[],
   employeesById: Map<string, SuggestionEmployee>,
   capacityByEmployee: Record<string, number>,
-  assignedByEmployee: Record<string, number>
+  assignedByEmployee: Record<string, number>,
+  assignedAislesByEmployee: Record<string, Set<string>>,
+  compactMode: boolean
 ) {
-  const candidates = buildCandidates(
-    task,
-    activeRoster,
-    employeesById,
-    capacityByEmployee,
-    assignedByEmployee
+  return (
+    sortedCandidates(
+      task,
+      activeRoster,
+      employeesById,
+      capacityByEmployee,
+      assignedByEmployee,
+      assignedAislesByEmployee,
+      compactMode
+    )[0] || null
   );
-
-  if (candidates.length === 0) return null;
-
-  return [...candidates].sort((a, b) => {
-    const scoreDifference = candidateScore(task, b) - candidateScore(task, a);
-    if (Math.abs(scoreDifference) > 0.0001) return scoreDifference;
-
-    if (a.shiftStartMinute !== b.shiftStartMinute) {
-      return a.shiftStartMinute - b.shiftStartMinute;
-    }
-
-    return a.name.localeCompare(b.name);
-  })[0];
 }
 
 function makeReason(
   task: SuggestionTask,
   candidate: Candidate,
   recoveryMode: boolean,
-  paceMultiplier: number
+  compactMode: boolean,
+  paceMultiplier: number,
+  stretched = false
 ) {
   const capacityText = `${Math.round(candidate.capacityMinutes)}m post-load capacity`;
 
@@ -198,6 +265,18 @@ function makeReason(
     return `Recovery target${skillText} · ${capacityText} · ${paceMultiplier.toFixed(
       2
     )}× standard pace`;
+  }
+
+  if (compactMode && task.name.startsWith('Aisle ')) {
+    const pairText =
+      candidate.aisleCount === 1
+        ? 'second aisle for this team member'
+        : 'compact small-load plan';
+    const stretchText = stretched
+      ? ` · achievable stretch up to ${SMALL_LOAD_STRETCH_MULTIPLIER.toFixed(2)}×`
+      : '';
+
+    return `${pairText} · ${capacityText}${stretchText}`;
   }
 
   if (task.name.startsWith('Aisle ') && candidate.skillRating > 0) {
@@ -213,6 +292,75 @@ function makeReason(
   }
 
   return `Best workload match · ${capacityText}`;
+}
+
+function recordAisle(
+  assignedAislesByEmployee: Record<string, Set<string>>,
+  employeeId: string,
+  taskName: string
+) {
+  if (!taskName.startsWith('Aisle ')) return;
+
+  if (!assignedAislesByEmployee[employeeId]) {
+    assignedAislesByEmployee[employeeId] = new Set<string>();
+  }
+
+  assignedAislesByEmployee[employeeId].add(taskName);
+}
+
+function addSuggestion({
+  task,
+  candidate,
+  targetMinutes,
+  standardMinutes,
+  suggestions,
+  assignedByEmployee,
+  assignedAislesByEmployee,
+  recoveryMode,
+  compactMode,
+  paceMultiplier,
+  stretched = false,
+}: {
+  task: SuggestionTask;
+  candidate: Candidate;
+  targetMinutes: number;
+  standardMinutes: number;
+  suggestions: SuggestedAllocation[];
+  assignedByEmployee: Record<string, number>;
+  assignedAislesByEmployee: Record<string, Set<string>>;
+  recoveryMode: boolean;
+  compactMode: boolean;
+  paceMultiplier: number;
+  stretched?: boolean;
+}) {
+  mergeAllocation(suggestions, {
+    employeeId: candidate.employeeId,
+    taskName: task.name,
+    minutes: targetMinutes,
+    standardMinutes,
+    source: 'suggested',
+    skillRating: task.name.startsWith('Aisle ')
+      ? candidate.skillRating
+      : null,
+    reason: makeReason(
+      task,
+      candidate,
+      recoveryMode,
+      compactMode,
+      paceMultiplier,
+      stretched
+    ),
+    recovery: recoveryMode,
+  });
+
+  assignedByEmployee[candidate.employeeId] =
+    (assignedByEmployee[candidate.employeeId] || 0) + targetMinutes;
+
+  recordAisle(
+    assignedAislesByEmployee,
+    candidate.employeeId,
+    task.name
+  );
 }
 
 function buildTaskTargets(
@@ -269,12 +417,111 @@ function allocateTaskTarget(
   employeesById: Map<string, SuggestionEmployee>,
   capacityByEmployee: Record<string, number>,
   assignedByEmployee: Record<string, number>,
+  assignedAislesByEmployee: Record<string, Set<string>>,
   suggestions: SuggestedAllocation[],
   recoveryMode: boolean,
+  compactMode: boolean,
   paceMultiplier: number
 ) {
   let targetRemaining = Math.max(Math.round(targetMinutes), 0);
   let standardRemaining = Math.max(standardMinutes, 0);
+
+  /*
+   * Light-load aisle ownership:
+   * Prefer a whole aisle to one person when it fits. If it is only slightly
+   * above their remaining target time, allow a modest stretch target instead
+   * of automatically splitting the aisle. This is a planning suggestion, not
+   * a guarantee; standard Fill Assist minutes remain visible separately.
+   */
+  if (compactMode && task.name.startsWith('Aisle ') && standardRemaining > 0) {
+    const candidates = sortedCandidates(
+      task,
+      activeRoster,
+      employeesById,
+      capacityByEmployee,
+      assignedByEmployee,
+      assignedAislesByEmployee,
+      compactMode
+    );
+
+    if (recoveryMode) {
+      const candidate = candidates.find(
+        (item) => item.remainingMinutes >= targetRemaining
+      );
+
+      if (candidate && targetRemaining > 0) {
+        addSuggestion({
+          task,
+          candidate,
+          targetMinutes: targetRemaining,
+          standardMinutes: standardRemaining,
+          suggestions,
+          assignedByEmployee,
+          assignedAislesByEmployee,
+          recoveryMode,
+          compactMode,
+          paceMultiplier,
+        });
+
+        return {
+          targetRemaining: 0,
+          standardRemaining: 0,
+        };
+      }
+    } else {
+      const exact = candidates.find(
+        (item) => item.remainingMinutes >= standardRemaining
+      );
+
+      if (exact) {
+        addSuggestion({
+          task,
+          candidate: exact,
+          targetMinutes: standardRemaining,
+          standardMinutes: standardRemaining,
+          suggestions,
+          assignedByEmployee,
+          assignedAislesByEmployee,
+          recoveryMode,
+          compactMode,
+          paceMultiplier,
+        });
+
+        return {
+          targetRemaining: 0,
+          standardRemaining: 0,
+        };
+      }
+
+      const stretched = candidates.find(
+        (item) =>
+          item.remainingMinutes > 0 &&
+          standardRemaining / item.remainingMinutes <=
+            SMALL_LOAD_STRETCH_MULTIPLIER
+      );
+
+      if (stretched) {
+        addSuggestion({
+          task,
+          candidate: stretched,
+          targetMinutes: stretched.remainingMinutes,
+          standardMinutes: standardRemaining,
+          suggestions,
+          assignedByEmployee,
+          assignedAislesByEmployee,
+          recoveryMode,
+          compactMode,
+          paceMultiplier,
+          stretched: true,
+        });
+
+        return {
+          targetRemaining: 0,
+          standardRemaining: 0,
+        };
+      }
+    }
+  }
 
   while (targetRemaining > 0) {
     const candidate = chooseCandidate(
@@ -282,7 +529,9 @@ function allocateTaskTarget(
       activeRoster,
       employeesById,
       capacityByEmployee,
-      assignedByEmployee
+      assignedByEmployee,
+      assignedAislesByEmployee,
+      compactMode
     );
 
     if (!candidate) break;
@@ -305,26 +554,19 @@ function allocateTaskTarget(
               : targetChunk
           );
 
-    mergeAllocation(suggestions, {
-      employeeId: candidate.employeeId,
-      taskName: task.name,
-      minutes: targetChunk,
+    addSuggestion({
+      task,
+      candidate,
+      targetMinutes: targetChunk,
       standardMinutes: standardChunk,
-      source: 'suggested',
-      skillRating: task.name.startsWith('Aisle ')
-        ? candidate.skillRating
-        : null,
-      reason: makeReason(
-        task,
-        candidate,
-        recoveryMode,
-        paceMultiplier
-      ),
-      recovery: recoveryMode,
+      suggestions,
+      assignedByEmployee,
+      assignedAislesByEmployee,
+      recoveryMode,
+      compactMode,
+      paceMultiplier,
     });
 
-    assignedByEmployee[candidate.employeeId] =
-      (assignedByEmployee[candidate.employeeId] || 0) + targetChunk;
     targetRemaining -= targetChunk;
     standardRemaining = Math.max(
       standardRemaining - standardChunk,
@@ -370,11 +612,13 @@ export function buildAllocationSuggestions({
 
   const capacityByEmployee: Record<string, number> = {};
   const assignedByEmployee: Record<string, number> = {};
+  const assignedAislesByEmployee: Record<string, Set<string>> = {};
 
   for (const entry of activeRoster) {
     capacityByEmployee[entry.employeeId] =
       calculateAvailableAfterLoad(entry, loadArrivalTime);
     assignedByEmployee[entry.employeeId] = 0;
+    assignedAislesByEmployee[entry.employeeId] = new Set<string>();
   }
 
   const orderedTasks = [...tasks]
@@ -389,11 +633,27 @@ export function buildAllocationSuggestions({
     (total, entry) => total + (capacityByEmployee[entry.employeeId] || 0),
     0
   );
+  const aisleTaskCount = orderedTasks.filter(
+    (task) => task.name.startsWith('Aisle ')
+  ).length;
+
   const shortageMinutes = Math.max(
     totalRequiredMinutes - totalAvailableMinutes,
     0
   );
   const recoveryMode = shortageMinutes > 0;
+
+  /*
+   * A light load should not create unnecessary one-aisle ownership across a
+   * large team. When the full load is four standard labour-hours or less and
+   * there are at least two aisles, prefer compact two-aisle ownership where
+   * real remaining shift capacity allows it.
+   */
+  const compactMode =
+    totalRequiredMinutes > 0 &&
+    totalRequiredMinutes <= SMALL_LOAD_LIMIT_MINUTES &&
+    aisleTaskCount >= 2;
+
   const paceMultiplier =
     totalAvailableMinutes > 0
       ? Math.max(totalRequiredMinutes / totalAvailableMinutes, 1)
@@ -405,7 +665,13 @@ export function buildAllocationSuggestions({
       ? Math.ceil(paceMultiplier * 100)
       : null;
 
-  const effectivePreserveExisting = preserveExisting && !recoveryMode;
+  /*
+   * Recovery and compact modes should generate a fresh suggestion. Existing
+   * manager allocations remain stored until the manager explicitly saves the
+   * new plan; they are simply not allowed to distort the new recommendation.
+   */
+  const effectivePreserveExisting =
+    preserveExisting && !recoveryMode && !compactMode;
 
   const retainedExisting = effectivePreserveExisting
     ? existingAllocations.filter(
@@ -418,6 +684,12 @@ export function buildAllocationSuggestions({
   for (const allocation of retainedExisting) {
     assignedByEmployee[allocation.employeeId] =
       (assignedByEmployee[allocation.employeeId] || 0) + allocation.minutes;
+
+    recordAisle(
+      assignedAislesByEmployee,
+      allocation.employeeId,
+      allocation.taskName
+    );
   }
 
   const existingSuggestedShape: SuggestedAllocation[] = retainedExisting.map(
@@ -479,8 +751,10 @@ export function buildAllocationSuggestions({
       employeesById,
       capacityByEmployee,
       assignedByEmployee,
+      assignedAislesByEmployee,
       suggestions,
       recoveryMode,
+      compactMode,
       Number.isFinite(paceMultiplier) ? paceMultiplier : 1
     );
 
@@ -515,6 +789,7 @@ export function buildAllocationSuggestions({
     employeeRemainingMinutes,
     employeeOverloadMinutes,
     recoveryMode,
+    compactMode,
     shortageMinutes,
     requiredPacePercent,
     paceMultiplier:
