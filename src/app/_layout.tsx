@@ -80,6 +80,7 @@ export default function RootLayout() {
         <Tabs.Screen name="live-progress" options={{ href: null }} />
         <Tabs.Screen name="night-summary" options={{ href: null }} />
         <Tabs.Screen name="load-arrival" options={{ href: null }} />
+        <Tabs.Screen name="group-roster" options={{ href: null }} />
 
         <Tabs.Screen name="add-employee" options={{ href: null }} />
         <Tabs.Screen name="employee/[id]" options={{ href: null }} />
