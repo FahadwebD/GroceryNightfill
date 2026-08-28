@@ -1,1 +1,1 @@
-export { default } from '../components/auto-live-progress';
+export { default } from '../components/live-progress-schedule';
