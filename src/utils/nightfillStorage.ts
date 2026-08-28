@@ -1,9 +1,15 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import {
+  calculateShiftMinutes,
   getDateKey,
   getNightfillDate,
+  type PlanningRosterEntry,
 } from './nightfillPlanning';
+import {
+  calculateBreakSummary,
+  getBreakRules,
+} from './breakRules';
 import { appendAuditLog } from './auditLog';
 
 export const NIGHTFILL_STORAGE = {
@@ -56,6 +62,47 @@ export async function writeStorage<T>(
   await AsyncStorage.setItem(key, JSON.stringify(value));
 }
 
+export async function applyBreakRulesToRoster(
+  roster: PlanningRosterEntry[]
+) {
+  const config = await getBreakRules();
+
+  return roster.map((entry) => {
+    const shiftMinutes = calculateShiftMinutes(entry);
+    const summary = calculateBreakSummary(
+      shiftMinutes,
+      config
+    );
+
+    return {
+      ...entry,
+      breakMinutes:
+        entry.status === 'Sick' ||
+        entry.status === 'No Show'
+          ? 0
+          : summary.productiveBreakMinutes,
+    };
+  });
+}
+
+async function enrichNightValue<T>(
+  storageKey: string,
+  value: T
+): Promise<T> {
+  if (
+    storageKey !== NIGHTFILL_STORAGE.roster ||
+    !Array.isArray(value)
+  ) {
+    return value;
+  }
+
+  const enriched = await applyBreakRulesToRoster(
+    value as PlanningRosterEntry[]
+  );
+
+  return enriched as T;
+}
+
 export async function readNightValue<T>(
   storageKey: string,
   dateKey: string,
@@ -67,14 +114,20 @@ export async function readNightValue<T>(
   );
 
   if (record[dateKey] !== undefined) {
-    return record[dateKey];
+    return enrichNightValue(
+      storageKey,
+      record[dateKey]
+    );
   }
 
   if (
     legacyDayName &&
     record[legacyDayName] !== undefined
   ) {
-    return record[legacyDayName];
+    return enrichNightValue(
+      storageKey,
+      record[legacyDayName]
+    );
   }
 
   return null;
