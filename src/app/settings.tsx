@@ -117,6 +117,19 @@ export default function SettingsScreen() {
 
         <Text style={styles.sectionTitle}>Nightfill Setup</Text>
 
+        <TouchableOpacity
+          style={styles.settingCard}
+          onPress={() => router.push('/night-captain-settings')}
+        >
+          <View style={styles.settingInfo}>
+            <Text style={styles.settingTitle}>Night Captain</Text>
+            <Text style={styles.settingSubtitle}>
+              Choose Captain working nights and the default 6 PM–3 AM shift
+            </Text>
+          </View>
+          <Text style={styles.arrow}>›</Text>
+        </TouchableOpacity>
+
         <SettingCard
           title="Grocery Aisles"
           subtitle="Add and manage grocery aisle names"
