@@ -73,10 +73,11 @@ function mergeAllocation(
   );
 
   if (existing) {
-    existing.minutes += next.minutes;
+    const previousMinutes = existing.minutes;
+    const previousStandard = existing.standardMinutes ?? previousMinutes;
+    existing.minutes = previousMinutes + next.minutes;
     existing.standardMinutes =
-      (existing.standardMinutes ?? existing.minutes) +
-      (next.standardMinutes ?? next.minutes);
+      previousStandard + (next.standardMinutes ?? next.minutes);
     return;
   }
 
@@ -404,10 +405,6 @@ export function buildAllocationSuggestions({
       ? Math.ceil(paceMultiplier * 100)
       : null;
 
-  /*
-   * If actual arrival creates shortage, previous provisional allocations are
-   * not treated as fixed. We build a fresh target-time recovery suggestion.
-   */
   const effectivePreserveExisting = preserveExisting && !recoveryMode;
 
   const retainedExisting = effectivePreserveExisting
