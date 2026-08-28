@@ -1,684 +1,163 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useMemo, useState } from 'react';
 
 import {
-    router,
-    useFocusEffect,
-} from 'expo-router';
-
-import {
-    useCallback,
-    useMemo,
-    useState,
-} from 'react';
-
-import {
-    ScrollView,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 
-/*
-|--------------------------------------------------------------------------
-| TYPES
-|--------------------------------------------------------------------------
-*/
+import {
+  buildEmployeePlans,
+  buildTeamTaskPlans,
+  calculateLabourPosition,
+  formatClock,
+  formatMinutes,
+  formatNightMinute,
+  formatSignedMinutes,
+  type PlanningAllocation,
+  type PlanningRosterEntry,
+} from '../utils/nightfillPlanning';
+
+import {
+  getTonightContext,
+  NIGHTFILL_STORAGE,
+  readNightValue,
+  readStorage,
+} from '../utils/nightfillStorage';
 
 type Employee = {
   id: string;
   name: string;
+  aisleSkills?: Record<string, number>;
 };
 
-type ShiftStatus =
-  | 'Working'
-  | 'Sick'
-  | 'Late'
-  | 'Left Early'
-  | 'No Show'
-  | 'Called In';
-
-type RosterEntry = {
-  employeeId: string;
-
-  hours: string;
-
-  startTime?: string;
-
-  finishTime?: string;
-
-  status: ShiftStatus;
-
-  isExtra: boolean;
+type NightLoad = {
+  day: string;
+  dateKey?: string;
+  totalCartons: number;
+  totalRequiredMinutes: number;
+  aisleMinutes: number;
+  promoMinutes: number;
+  protectMinutes: number;
+  splittingMinutes: number;
+  otherOrganisingMinutes: number;
 };
-
-type SavedRoster = Record<
-  string,
-  RosterEntry[]
->;
-
-type Allocation = {
-  employeeId: string;
-
-  taskName: string;
-
-  minutes: number;
-};
-
-type SavedAllocations = Record<
-  string,
-  Allocation[]
->;
 
 type LoadArrivalRecord = {
   day: string;
-
   expectedTime: string;
-
   actualTime: string | null;
-
   actualTimestamp: string | null;
-
   arrived: boolean;
-
   updatedAt: string;
 };
 
-type SavedLoadArrivals = Record<
-  string,
-  LoadArrivalRecord
->;
-
-type PlannedTask = {
-  taskName: string;
-
-  minutes: number;
-
-  startMinute: number;
-
-  finishMinute: number;
-};
-
-type EmployeePlan = {
-  employee: Employee;
-
-  roster: RosterEntry;
-
-  availableMinutes: number;
-
-  allocatedMinutes: number;
-
-  remainingMinutes: number;
-
-  planStartMinute: number;
-
-  rosterFinishMinute: number;
-
-  plannedFinishMinute: number;
-
-  overrunMinutes: number;
-
-  tasks: PlannedTask[];
-};
-
-/*
-|--------------------------------------------------------------------------
-| NIGHTFILL DATE
-|--------------------------------------------------------------------------
-*/
-
-const dayNames = [
-  'Sunday',
-  'Monday',
-  'Tuesday',
-  'Wednesday',
-  'Thursday',
-  'Friday',
-  'Saturday',
-];
-
-function getNightfillDate() {
-  const now =
-    new Date();
-
-  const date =
-    new Date(now);
-
-  if (
-    date.getHours() < 5
-  ) {
-    date.setDate(
-      date.getDate() - 1
-    );
-  }
-
-  return date;
-}
-
-function getDateKey(
-  date: Date
+function employeeName(
+  employees: Employee[],
+  employeeId: string
 ) {
-  const year =
-    date.getFullYear();
-
-  const month =
-    String(
-      date.getMonth() + 1
-    ).padStart(
-      2,
-      '0'
-    );
-
-  const day =
-    String(
-      date.getDate()
-    ).padStart(
-      2,
-      '0'
-    );
-
-  return `${year}-${month}-${day}`;
+  return (
+    employees.find(
+      (employee) => employee.id === employeeId
+    )?.name || 'Team member'
+  );
 }
 
-/*
-|--------------------------------------------------------------------------
-| TIME
-|--------------------------------------------------------------------------
-*/
-
-function normaliseTime(
-  value: string
-) {
-  const text =
-    value.trim();
-
-  if (!text) {
-    return '';
-  }
-
-  const parts =
-    text.split(':');
-
-  const hour =
-    Number(
-      parts[0]
-    );
-
-  const minute =
-    parts.length > 1
-      ? Number(
-          parts[1]
-        )
-      : 0;
-
-  if (
-    Number.isNaN(hour) ||
-    Number.isNaN(minute)
-  ) {
-    return '';
-  }
-
-  if (
-    hour < 0 ||
-    hour > 23 ||
-    minute < 0 ||
-    minute > 59
-  ) {
-    return '';
-  }
-
-  return `${String(
-    hour
-  ).padStart(
-    2,
-    '0'
-  )}:${String(
-    minute
-  ).padStart(
-    2,
-    '0'
-  )}`;
+function initials(name: string) {
+  return name
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => part[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase();
 }
-
-/*
- * Converts the Nightfill clock
- * into one continuous timeline.
- *
- * 17:00 = 1020
- * 23:00 = 1380
- * 01:00 = 1500
- * 05:00 = 1740
- */
-
-function timeToNightMinutes(
-  value: string
-) {
-  const time =
-    normaliseTime(
-      value
-    );
-
-  if (!time) {
-    return null;
-  }
-
-  const [
-    hour,
-    minute,
-  ] =
-    time
-      .split(':')
-      .map(Number);
-
-  let total =
-    hour * 60 +
-    minute;
-
-  if (
-    hour < 5
-  ) {
-    total +=
-      24 * 60;
-  }
-
-  return total;
-}
-
-/*
-|--------------------------------------------------------------------------
-| FORMAT CLOCK FROM NIGHT MINUTES
-|--------------------------------------------------------------------------
-*/
-
-function formatNightMinute(
-  totalMinutes: number
-) {
-  let safe =
-    Math.round(
-      totalMinutes
-    );
-
-  safe =
-    safe %
-    (24 * 60);
-
-  if (safe < 0) {
-    safe +=
-      24 * 60;
-  }
-
-  const hour24 =
-    Math.floor(
-      safe / 60
-    );
-
-  const minute =
-    safe % 60;
-
-  const suffix =
-    hour24 >= 12
-      ? 'PM'
-      : 'AM';
-
-  let hour12 =
-    hour24 % 12;
-
-  if (
-    hour12 === 0
-  ) {
-    hour12 = 12;
-  }
-
-  return `${hour12}:${String(
-    minute
-  ).padStart(
-    2,
-    '0'
-  )} ${suffix}`;
-}
-
-function formatDuration(
-  totalMinutes: number
-) {
-  const safe =
-    Math.max(
-      Math.round(
-        totalMinutes || 0
-      ),
-      0
-    );
-
-  const hours =
-    Math.floor(
-      safe / 60
-    );
-
-  const minutes =
-    safe % 60;
-
-  if (
-    hours === 0
-  ) {
-    return `${minutes}m`;
-  }
-
-  if (
-    minutes === 0
-  ) {
-    return `${hours}h`;
-  }
-
-  return `${hours}h ${minutes}m`;
-}
-
-/*
-|--------------------------------------------------------------------------
-| TASK ORDER
-|--------------------------------------------------------------------------
-*/
-
-function getTaskOrder(
-  taskName: string
-) {
-  if (
-    taskName ===
-    'Splitting'
-  ) {
-    return 0;
-  }
-
-  if (
-    taskName.startsWith(
-      'Aisle '
-    )
-  ) {
-    return (
-      Number(
-        taskName.replace(
-          'Aisle ',
-          ''
-        )
-      ) || 50
-    );
-  }
-
-  if (
-    taskName ===
-    'Promo'
-  ) {
-    return 100;
-  }
-
-  if (
-    taskName ===
-    'Protect - Aisle'
-  ) {
-    return 101;
-  }
-
-  if (
-    taskName ===
-    'Other / Organising'
-  ) {
-    return 102;
-  }
-
-  return 999;
-}
-
-/*
-|--------------------------------------------------------------------------
-| CALCULATE AVAILABLE LOAD TIME
-|--------------------------------------------------------------------------
-*/
-
-function calculateEmployeeWindow(
-  entry: RosterEntry,
-  arrivalTime:
-    | string
-    | null
-) {
-  if (
-    !entry.startTime ||
-    !entry.finishTime
-  ) {
-    const legacyMinutes =
-      Math.round(
-        (
-          Number(
-            entry.hours
-          ) || 0
-        ) * 60
-      );
-
-    return {
-      start:
-        17 * 60,
-
-      finish:
-        17 * 60 +
-        legacyMinutes,
-
-      availableMinutes:
-        legacyMinutes,
-    };
-  }
-
-  const start =
-    timeToNightMinutes(
-      entry.startTime
-    );
-
-  let finish =
-    timeToNightMinutes(
-      entry.finishTime
-    );
-
-  if (
-    start === null ||
-    finish === null
-  ) {
-    return {
-      start: 0,
-      finish: 0,
-      availableMinutes: 0,
-    };
-  }
-
-  if (
-    finish <= start
-  ) {
-    finish +=
-      24 * 60;
-  }
-
-  let usableStart =
-    start;
-
-  if (arrivalTime) {
-    const arrival =
-      timeToNightMinutes(
-        arrivalTime
-      );
-
-    if (
-      arrival !== null
-    ) {
-      usableStart =
-        Math.max(
-          start,
-          arrival
-        );
-    }
-  }
-
-  if (
-    usableStart >= finish
-  ) {
-    return {
-      start:
-        usableStart,
-
-      finish,
-
-      availableMinutes:
-        0,
-    };
-  }
-
-  return {
-    start:
-      usableStart,
-
-    finish,
-
-    availableMinutes:
-      finish -
-      usableStart,
-  };
-}
-
-/*
-|--------------------------------------------------------------------------
-| SCREEN
-|--------------------------------------------------------------------------
-*/
 
 export default function TeamPlanScreen() {
-  const nightfillDate =
-    getNightfillDate();
+  const nightContext = useMemo(
+    () => getTonightContext(),
+    []
+  );
 
-  const currentDay =
-    dayNames[
-      nightfillDate.getDay()
-    ];
+  const {
+    date: nightfillDate,
+    dateKey,
+    dayName,
+  } = nightContext;
 
-  const dateKey =
-    getDateKey(
-      nightfillDate
-    );
-
-  const [
-    employees,
-    setEmployees,
-  ] =
+  const [employees, setEmployees] =
     useState<Employee[]>([]);
 
-  const [
-    roster,
-    setRoster,
-  ] =
-    useState<RosterEntry[]>([]);
+  const [roster, setRoster] =
+    useState<PlanningRosterEntry[]>([]);
 
-  const [
-    allocations,
-    setAllocations,
-  ] =
-    useState<Allocation[]>([]);
+  const [allocations, setAllocations] =
+    useState<PlanningAllocation[]>([]);
 
-  const [
-    loadArrival,
-    setLoadArrival,
-  ] =
-    useState<LoadArrivalRecord | null>(
-      null
-    );
+  const [load, setLoad] =
+    useState<NightLoad | null>(null);
 
-  const [
-    loading,
-    setLoading,
-  ] =
+  const [loadArrival, setLoadArrival] =
+    useState<LoadArrivalRecord | null>(null);
+
+  const [loading, setLoading] =
     useState(true);
 
-  /*
-|--------------------------------------------------------------------------
-| LOAD
-|--------------------------------------------------------------------------
-*/
-
-  useFocusEffect(
-    useCallback(() => {
-      loadData();
-    }, [])
-  );
+  const formattedDate =
+    nightfillDate.toLocaleDateString(
+      'en-AU',
+      {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+      }
+    );
 
   async function loadData() {
     try {
       setLoading(true);
 
-      const storedEmployees =
-        await AsyncStorage.getItem(
-          'groceryEmployees'
-        );
+      const [
+        storedEmployees,
+        tonightRoster,
+        tonightAllocations,
+        tonightLoad,
+        tonightArrival,
+      ] = await Promise.all([
+        readStorage<Employee[]>(
+          'groceryEmployees',
+          []
+        ),
+        readNightValue<PlanningRosterEntry[]>(
+          NIGHTFILL_STORAGE.roster,
+          dateKey,
+          dayName
+        ),
+        readNightValue<PlanningAllocation[]>(
+          NIGHTFILL_STORAGE.allocations,
+          dateKey,
+          dayName
+        ),
+        readNightValue<NightLoad>(
+          NIGHTFILL_STORAGE.loads,
+          dateKey,
+          dayName
+        ),
+        readNightValue<LoadArrivalRecord>(
+          NIGHTFILL_STORAGE.arrivals,
+          dateKey,
+          dayName
+        ),
+      ]);
 
-      setEmployees(
-        storedEmployees
-          ? JSON.parse(
-              storedEmployees
-            )
-          : []
-      );
-
-      const storedRoster =
-        await AsyncStorage.getItem(
-          'groceryNightRoster'
-        );
-
-      const parsedRoster:
-        SavedRoster =
-        storedRoster
-          ? JSON.parse(
-              storedRoster
-            )
-          : {};
-
-      setRoster(
-        parsedRoster[
-          currentDay
-        ] || []
-      );
-
-      const storedAllocations =
-        await AsyncStorage.getItem(
-          'groceryNightAllocations'
-        );
-
-      const parsedAllocations:
-        SavedAllocations =
-        storedAllocations
-          ? JSON.parse(
-              storedAllocations
-            )
-          : {};
-
-      setAllocations(
-        parsedAllocations[
-          currentDay
-        ] || []
-      );
-
-      const storedArrival =
-        await AsyncStorage.getItem(
-          'groceryLoadArrivals'
-        );
-
-      const parsedArrival:
-        SavedLoadArrivals =
-        storedArrival
-          ? JSON.parse(
-              storedArrival
-            )
-          : {};
-
-      setLoadArrival(
-        parsedArrival[
-          dateKey
-        ] ||
-          parsedArrival[
-            currentDay
-          ] ||
-          null
-      );
+      setEmployees(storedEmployees);
+      setRoster(tonightRoster || []);
+      setAllocations(tonightAllocations || []);
+      setLoad(tonightLoad || null);
+      setLoadArrival(tonightArrival || null);
     } catch (error) {
       console.log(
         'LOAD TEAM PLAN ERROR:',
@@ -689,1600 +168,981 @@ export default function TeamPlanScreen() {
     }
   }
 
-  /*
-|--------------------------------------------------------------------------
-| ACTIVE ROSTER
-|--------------------------------------------------------------------------
-*/
-
-  const workingRoster =
-    useMemo(
-      () =>
-        roster.filter(
-          (entry) =>
-            entry.status !==
-              'Sick' &&
-            entry.status !==
-              'No Show'
-        ),
-      [roster]
-    );
+  useFocusEffect(
+    useCallback(() => {
+      loadData();
+    }, [])
+  );
 
   const arrivalTime =
     loadArrival?.arrived
       ? loadArrival.actualTime
       : null;
 
-  /*
-|--------------------------------------------------------------------------
-| BUILD PLANS
-|--------------------------------------------------------------------------
-*/
+  const employeePlans =
+    useMemo(
+      () =>
+        buildEmployeePlans(
+          roster,
+          allocations,
+          arrivalTime
+        ),
+      [roster, allocations, arrivalTime]
+    );
 
-  const employeePlans:
-    EmployeePlan[] =
-    useMemo(() => {
-      return workingRoster
-        .map(
-          (
-            entry
-          ): EmployeePlan | null => {
-            const employee =
-              employees.find(
-                (item) =>
-                  item.id ===
-                  entry.employeeId
-              );
+  const teamTaskPlans =
+    useMemo(
+      () =>
+        buildTeamTaskPlans(
+          employeePlans
+        ),
+      [employeePlans]
+    );
 
-            if (!employee) {
-              return null;
-            }
+  const requiredMinutes =
+    load?.totalRequiredMinutes || 0;
 
-            const window =
-              calculateEmployeeWindow(
-                entry,
-                arrivalTime
-              );
-
-            const employeeAllocations =
-              allocations
-                .filter(
-                  (allocation) =>
-                    allocation.employeeId ===
-                      entry.employeeId &&
-                    allocation.minutes >
-                      0
-                )
-                .sort(
-                  (a, b) =>
-                    getTaskOrder(
-                      a.taskName
-                    ) -
-                    getTaskOrder(
-                      b.taskName
-                    )
-                );
-
-            /*
-             * Tasks run sequentially
-             * starting from the employee's
-             * usable load start.
-             */
-
-            let cursor =
-              window.start;
-
-            const tasks:
-              PlannedTask[] =
-              employeeAllocations.map(
-                (allocation) => {
-                  const task:
-                    PlannedTask = {
-                    taskName:
-                      allocation.taskName,
-
-                    minutes:
-                      allocation.minutes,
-
-                    startMinute:
-                      cursor,
-
-                    finishMinute:
-                      cursor +
-                      allocation.minutes,
-                  };
-
-                  cursor =
-                    task.finishMinute;
-
-                  return task;
-                }
-              );
-
-            const allocatedMinutes =
-              employeeAllocations.reduce(
-                (
-                  total,
-                  allocation
-                ) =>
-                  total +
-                  allocation.minutes,
-                0
-              );
-
-            const remainingMinutes =
-              Math.max(
-                window.availableMinutes -
-                  allocatedMinutes,
-                0
-              );
-
-            const overrunMinutes =
-              Math.max(
-                cursor -
-                  window.finish,
-                0
-              );
-
-            return {
-              employee,
-
-              roster:
-                entry,
-
-              availableMinutes:
-                window.availableMinutes,
-
-              allocatedMinutes,
-
-              remainingMinutes,
-
-              planStartMinute:
-                window.start,
-
-              rosterFinishMinute:
-                window.finish,
-
-              plannedFinishMinute:
-                cursor,
-
-              overrunMinutes,
-
-              tasks,
-            };
-          }
-        )
-        .filter(
-          (
-            plan
-          ): plan is EmployeePlan =>
-            plan !== null
-        );
-    }, [
-      workingRoster,
-      employees,
-      allocations,
-      arrivalTime,
-    ]);
-
-  /*
-|--------------------------------------------------------------------------
-| TOTALS
-|--------------------------------------------------------------------------
-*/
-
-  const totalAvailableMinutes =
-    employeePlans.reduce(
-      (
-        total,
-        plan
-      ) =>
-        total +
-        plan.availableMinutes,
-      0
+  const labourPosition =
+    useMemo(
+      () =>
+        calculateLabourPosition(
+          roster,
+          requiredMinutes,
+          arrivalTime
+        ),
+      [roster, requiredMinutes, arrivalTime]
     );
 
   const totalAllocatedMinutes =
-    employeePlans.reduce(
-      (
-        total,
-        plan
-      ) =>
-        total +
-        plan.allocatedMinutes,
+    allocations.reduce(
+      (total, allocation) =>
+        total + Math.max(allocation.minutes || 0, 0),
       0
     );
 
   const totalRemainingMinutes =
     employeePlans.reduce(
-      (
-        total,
-        plan
-      ) =>
-        total +
-        plan.remainingMinutes,
+      (total, plan) =>
+        total + plan.remainingMinutes,
       0
     );
 
-  const overrunEmployees =
-    employeePlans.filter(
-      (plan) =>
-        plan.overrunMinutes >
-        0
+  const totalOverrunMinutes =
+    employeePlans.reduce(
+      (total, plan) =>
+        total + plan.overrunMinutes,
+      0
     );
 
-  /*
-|--------------------------------------------------------------------------
-| LOADING
-|--------------------------------------------------------------------------
-*/
+  const activePlannedEmployees =
+    employeePlans.filter(
+      (plan) => plan.allocatedMinutes > 0
+    );
 
   if (loading) {
     return (
-      <View
-        style={
-          styles.center
-        }
-      >
-        <Text
-          style={
-            styles.loadingText
-          }
-        >
-          Loading team plan...
+      <View style={styles.center}>
+        <Text style={styles.loadingText}>
+          Building team plan...
         </Text>
       </View>
     );
   }
 
-  /*
-|--------------------------------------------------------------------------
-| UI
-|--------------------------------------------------------------------------
-*/
-
   return (
-    <View
-      style={
-        styles.container
-      }
-    >
-      <View
-        style={
-          styles.header
-        }
-      >
+    <View style={styles.container}>
+      <View style={styles.header}>
         <TouchableOpacity
-          onPress={() =>
-            router.back()
-          }
+          onPress={() => router.back()}
         >
-          <Text
-            style={
-              styles.back
-            }
-          >
+          <Text style={styles.back}>
             ‹ Allocation
           </Text>
         </TouchableOpacity>
 
-        <Text
-          style={
-            styles.headerSmall
-          }
-        >
-          REAL-TIME NIGHTFILL
+        <Text style={styles.headerSmall}>
+          FINAL MANAGER PLAN
         </Text>
 
-        <Text
-          style={
-            styles.title
-          }
-        >
+        <Text style={styles.title}>
           Team Plan
         </Text>
 
-        <Text
-          style={
-            styles.subtitle
-          }
-        >
-          {currentDay} Nightfill
+        <Text style={styles.subtitle}>
+          {formattedDate} · {dateKey}
         </Text>
       </View>
 
       <ScrollView
-        contentContainerStyle={
-          styles.content
-        }
-        showsVerticalScrollIndicator={
-          false
-        }
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.content}
       >
-        {/* LOAD START */}
-
         <View
           style={[
-            styles.loadCard,
-
+            styles.arrivalCard,
             loadArrival?.arrived
-              ? styles.loadArrivedCard
-              : styles.loadWaitingCard,
+              ? styles.arrivalReady
+              : styles.arrivalWaiting,
           ]}
         >
           <View>
-            <Text
-              style={
-                styles.loadLabel
-              }
-            >
-              LOAD WORK START
+            <Text style={styles.arrivalLabel}>
+              LOAD TIMING
             </Text>
 
             <Text
               style={
                 loadArrival?.arrived
-                  ? styles.loadArrivedText
-                  : styles.loadWaitingText
+                  ? styles.arrivalReadyText
+                  : styles.arrivalWaitingText
               }
             >
-              {loadArrival?.arrived &&
-              arrivalTime
-                ? formatNightMinute(
-                    timeToNightMinutes(
-                      arrivalTime
-                    ) || 0
-                  )
-                : 'Load arrival not recorded'}
+              {loadArrival?.arrived
+                ? `Actual ${formatClock(
+                    loadArrival.actualTime
+                  )}`
+                : 'Arrival not recorded'}
             </Text>
           </View>
 
           <TouchableOpacity
             onPress={() =>
-              router.push(
-                '/load-arrival'
-              )
+              router.push('/load-arrival')
             }
           >
-            <Text
-              style={
-                styles.manageText
-              }
-            >
+            <Text style={styles.manageText}>
               Manage
             </Text>
           </TouchableOpacity>
         </View>
 
         {!loadArrival?.arrived && (
-          <View
-            style={
-              styles.warningCard
-            }
-          >
-            <Text
-              style={
-                styles.warningTitle
-              }
-            >
-              Timeline is provisional
+          <View style={styles.warningCard}>
+            <Text style={styles.warningTitle}>
+              Provisional timeline
             </Text>
-
-            <Text
-              style={
-                styles.warningText
-              }
-            >
-              Record the actual load arrival to make the planned start and finish times accurate.
+            <Text style={styles.warningText}>
+              Actual load arrival has not been recorded. The plan currently starts each employee from their rostered shift start.
             </Text>
           </View>
         )}
 
-        {/* TOTAL PLAN */}
-
-        <Text
-          style={
-            styles.sectionTitle
-          }
-        >
+        <Text style={styles.sectionTitle}>
           Plan Position
         </Text>
 
-        <View
-          style={
-            styles.summaryCard
-          }
-        >
-          <SummaryStat
-            label="Available"
-            value={formatDuration(
-              totalAvailableMinutes
-            )}
+        <View style={styles.summaryCard}>
+          <SummaryRow
+            label="Load required"
+            value={formatMinutes(requiredMinutes)}
           />
 
-          <View
-            style={
-              styles.summaryDivider
+          <SummaryRow
+            label={
+              loadArrival?.arrived
+                ? 'Available after arrival'
+                : 'Available roster labour'
             }
+            value={formatMinutes(
+              labourPosition.postArrivalMinutes
+            )}
+            tone="primary"
           />
 
-          <SummaryStat
-            label="Allocated"
-            value={formatDuration(
+          {loadArrival?.arrived && (
+            <SummaryRow
+              label="Labour before load"
+              value={formatMinutes(
+                labourPosition.preLoadMinutes
+              )}
+              tone="warning"
+            />
+          )}
+
+          <SummaryRow
+            label="Manager allocated"
+            value={formatMinutes(
               totalAllocatedMinutes
             )}
           />
 
-          <View
-            style={
-              styles.summaryDivider
-            }
-          />
-
-          <SummaryStat
-            label="Remaining"
-            value={formatDuration(
+          <SummaryRow
+            label="Staff time left"
+            value={formatMinutes(
               totalRemainingMinutes
             )}
-            positive
+            tone="good"
+          />
+
+          <View style={styles.divider} />
+
+          <SummaryRow
+            label={
+              labourPosition.differenceMinutes < 0
+                ? 'REAL SHORTAGE'
+                : 'REAL SURPLUS'
+            }
+            value={formatSignedMinutes(
+              labourPosition.differenceMinutes
+            )}
+            tone={
+              labourPosition.differenceMinutes < 0
+                ? 'danger'
+                : 'good'
+            }
           />
         </View>
 
-        {overrunEmployees.length >
-          0 && (
-          <View
-            style={
-              styles.overallWarning
-            }
-          >
-            <Text
-              style={
-                styles.overallWarningTitle
-              }
-            >
-              ⚠ {overrunEmployees.length}{' '}
-              employee
-              {overrunEmployees.length >
-              1
-                ? 's'
-                : ''}{' '}
-              over roster finish
+        {totalOverrunMinutes > 0 && (
+          <View style={styles.dangerCard}>
+            <Text style={styles.dangerTitle}>
+              Plan exceeds rostered load time
             </Text>
-
-            <Text
-              style={
-                styles.overallWarningText
-              }
-            >
-              Adjust their allocations before finalising tonight&apos;s plan.
+            <Text style={styles.dangerText}>
+              Final allocations run {formatMinutes(
+                totalOverrunMinutes
+              )} beyond available employee time. Return to Allocation and adjust the plan.
             </Text>
           </View>
         )}
 
-        {/* EMPLOYEE PLANS */}
+        <View style={styles.sectionHeader}>
+          <View>
+            <Text style={styles.sectionTitleNoMargin}>
+              Team Task Timeline
+            </Text>
+            <Text style={styles.helperText}>
+              Labour time and elapsed clock time are shown separately.
+            </Text>
+          </View>
 
-        <Text
-          style={
-            styles.sectionTitle
-          }
-        >
-          Employee Timeline
-        </Text>
+          <View style={styles.countBadge}>
+            <Text style={styles.countText}>
+              {teamTaskPlans.length}
+            </Text>
+          </View>
+        </View>
 
-        {employeePlans.length ===
-        0 ? (
-          <View
-            style={
-              styles.emptyCard
-            }
-          >
-            <Text
-              style={
-                styles.emptyTitle
-              }
-            >
-              No Team Plan
+        {teamTaskPlans.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyTitle}>
+              No final allocation yet
+            </Text>
+            <Text style={styles.emptyText}>
+              Open Staff Allocation, review the smart suggestions, make any manager edits, then save the final allocation.
             </Text>
 
-            <Text
-              style={
-                styles.emptyText
+            <TouchableOpacity
+              style={styles.primaryButton}
+              onPress={() =>
+                router.push('/allocation')
               }
             >
-              Prepare tonight&apos;s roster and staff allocation first.
-            </Text>
+              <Text style={styles.primaryButtonText}>
+                Open Staff Allocation
+              </Text>
+            </TouchableOpacity>
           </View>
         ) : (
-          employeePlans.map(
-            (plan) => {
-              const initials =
-                plan.employee.name
-                  .split(' ')
-                  .map(
-                    (part) =>
-                      part[0]
-                  )
-                  .join('')
-                  .slice(
-                    0,
-                    2
-                  )
-                  .toUpperCase();
+          teamTaskPlans.map((task) => {
+            const names = task.employeeIds.map(
+              (employeeId) =>
+                employeeName(
+                  employees,
+                  employeeId
+                )
+            );
 
-              return (
-                <View
-                  key={
-                    plan.employee.id
-                  }
-                  style={[
-                    styles.employeeCard,
-
-                    plan.overrunMinutes >
-                      0 &&
-                      styles.employeeCardOver,
-                  ]}
-                >
-                  {/* EMPLOYEE */}
-
-                  <View
-                    style={
-                      styles.employeeHeader
-                    }
-                  >
-                    <View
-                      style={
-                        styles.avatar
-                      }
-                    >
-                      <Text
-                        style={
-                          styles.avatarText
-                        }
-                      >
-                        {initials}
-                      </Text>
-                    </View>
-
-                    <View
-                      style={
-                        styles.employeeInfo
-                      }
-                    >
-                      <Text
-                        style={
-                          styles.employeeName
-                        }
-                      >
-                        {
-                          plan.employee
-                            .name
-                        }
-                      </Text>
-
-                      <Text
-                        style={
-                          styles.employeeShift
-                        }
-                      >
-                        Shift{' '}
-                        {plan.roster
-                          .startTime
-                          ? formatNightMinute(
-                              timeToNightMinutes(
-                                plan.roster.startTime
-                              ) || 0
-                            )
-                          : '—'}
-                        {' → '}
-                        {plan.roster
-                          .finishTime
-                          ? formatNightMinute(
-                              plan.rosterFinishMinute
-                            )
-                          : '—'}
-                      </Text>
-                    </View>
-
-                    <View
-                      style={
-                        styles.availableBadge
-                      }
-                    >
-                      <Text
-                        style={
-                          styles.availableBadgeLabel
-                        }
-                      >
-                        LOAD TIME
-                      </Text>
-
-                      <Text
-                        style={
-                          styles.availableBadgeValue
-                        }
-                      >
-                        {formatDuration(
-                          plan.availableMinutes
-                        )}
-                      </Text>
-                    </View>
+            return (
+              <View
+                key={task.taskName}
+                style={styles.teamTaskCard}
+              >
+                <View style={styles.teamTaskTop}>
+                  <View style={styles.teamTaskInfo}>
+                    <Text style={styles.teamTaskName}>
+                      {task.taskName}
+                    </Text>
+                    <Text style={styles.teamNames}>
+                      {names.join(' · ')}
+                    </Text>
                   </View>
 
-                  {/* PLAN TOTALS */}
-
-                  <View
-                    style={
-                      styles.employeeStats
-                    }
-                  >
-                    <EmployeeStat
-                      label="Allocated"
-                      value={formatDuration(
-                        plan.allocatedMinutes
-                      )}
-                    />
-
-                    <EmployeeStat
-                      label="Remaining"
-                      value={formatDuration(
-                        plan.remainingMinutes
-                      )}
-                      good
-                    />
-
-                    <EmployeeStat
-                      label="Plan Finish"
-                      value={
-                        plan.tasks.length >
-                        0
-                          ? formatNightMinute(
-                              plan.plannedFinishMinute
-                            )
-                          : '—'
-                      }
-                    />
+                  <View style={styles.staffBadge}>
+                    <Text style={styles.staffBadgeText}>
+                      {task.staffCount} staff
+                    </Text>
                   </View>
-
-                  {/* NO TASK */}
-
-                  {plan.tasks.length ===
-                  0 ? (
-                    <View
-                      style={
-                        styles.noTasksBox
-                      }
-                    >
-                      <Text
-                        style={
-                          styles.noTasksText
-                        }
-                      >
-                        No load tasks allocated
-                      </Text>
-                    </View>
-                  ) : (
-                    <View
-                      style={
-                        styles.timeline
-                      }
-                    >
-                      {plan.tasks.map(
-                        (
-                          task,
-                          index
-                        ) => {
-                          const taskOver =
-                            task.finishMinute >
-                            plan.rosterFinishMinute;
-
-                          return (
-                            <View
-                              key={`${plan.employee.id}-${task.taskName}-${index}`}
-                              style={
-                                styles.taskRow
-                              }
-                            >
-                              {/* TIMELINE LINE */}
-
-                              <View
-                                style={
-                                  styles.timelineRail
-                                }
-                              >
-                                <View
-                                  style={[
-                                    styles.timelineDot,
-
-                                    taskOver &&
-                                      styles.timelineDotDanger,
-                                  ]}
-                                />
-
-                                {index <
-                                  plan.tasks
-                                    .length -
-                                    1 && (
-                                  <View
-                                    style={
-                                      styles.timelineLine
-                                    }
-                                  />
-                                )}
-                              </View>
-
-                              {/* TASK */}
-
-                              <View
-                                style={[
-                                  styles.taskBox,
-
-                                  taskOver &&
-                                    styles.taskBoxOver,
-                                ]}
-                              >
-                                <View
-                                  style={
-                                    styles.taskTop
-                                  }
-                                >
-                                  <Text
-                                    style={
-                                      task.taskName ===
-                                      'Splitting'
-                                        ? styles.splittingTask
-                                        : styles.taskName
-                                    }
-                                  >
-                                    {
-                                      task.taskName
-                                    }
-                                  </Text>
-
-                                  <Text
-                                    style={
-                                      styles.taskDuration
-                                    }
-                                  >
-                                    {formatDuration(
-                                      task.minutes
-                                    )}
-                                  </Text>
-                                </View>
-
-                                <Text
-                                  style={
-                                    styles.taskTimes
-                                  }
-                                >
-                                  {formatNightMinute(
-                                    task.startMinute
-                                  )}
-                                  {' → '}
-                                  {formatNightMinute(
-                                    task.finishMinute
-                                  )}
-                                </Text>
-
-                                {taskOver && (
-                                  <Text
-                                    style={
-                                      styles.taskOverText
-                                    }
-                                  >
-                                    Runs past roster finish
-                                  </Text>
-                                )}
-                              </View>
-                            </View>
-                          );
-                        }
-                      )}
-                    </View>
-                  )}
-
-                  {/* FINISH POSITION */}
-
-                  {plan.tasks.length >
-                    0 && (
-                    <View
-                      style={[
-                        styles.finishBox,
-
-                        plan.overrunMinutes >
-                          0
-                          ? styles.finishDanger
-                          : styles.finishGood,
-                      ]}
-                    >
-                      {plan.overrunMinutes >
-                      0 ? (
-                        <>
-                          <Text
-                            style={
-                              styles.finishDangerTitle
-                            }
-                          >
-                            ⚠ PLAN RUNS OVER
-                          </Text>
-
-                          <Text
-                            style={
-                              styles.finishDangerValue
-                            }
-                          >
-                            {formatDuration(
-                              plan.overrunMinutes
-                            )}{' '}
-                            over
-                          </Text>
-
-                          <Text
-                            style={
-                              styles.finishSmall
-                            }
-                          >
-                            Employee finishes at{' '}
-                            {formatNightMinute(
-                              plan.rosterFinishMinute
-                            )}
-                          </Text>
-                        </>
-                      ) : (
-                        <>
-                          <Text
-                            style={
-                              styles.finishGoodTitle
-                            }
-                          >
-                            ✓ PLAN FITS SHIFT
-                          </Text>
-
-                          <Text
-                            style={
-                              styles.finishGoodValue
-                            }
-                          >
-                            {formatDuration(
-                              plan.remainingMinutes
-                            )}{' '}
-                            left
-                          </Text>
-
-                          <Text
-                            style={
-                              styles.finishSmall
-                            }
-                          >
-                            Plan finishes{' '}
-                            {formatNightMinute(
-                              plan.plannedFinishMinute
-                            )}
-                          </Text>
-                        </>
-                      )}
-                    </View>
-                  )}
                 </View>
-              );
-            }
-          )
+
+                <View style={styles.timelineBox}>
+                  <Text style={styles.timelineClock}>
+                    {formatNightMinute(
+                      task.plannedStartMinute
+                    )}
+                    {'  →  '}
+                    {formatNightMinute(
+                      task.plannedFinishMinute
+                    )}
+                  </Text>
+
+                  <Text style={styles.timelineMeta}>
+                    {formatMinutes(
+                      task.allocatedLabourMinutes
+                    )} labour · {formatMinutes(
+                      task.elapsedMinutes
+                    )} elapsed
+                  </Text>
+                </View>
+              </View>
+            );
+          })
         )}
 
-        {/* ACTIONS */}
+        <View style={styles.sectionHeader}>
+          <View>
+            <Text style={styles.sectionTitleNoMargin}>
+              Employee Plans
+            </Text>
+            <Text style={styles.helperText}>
+              Each employee follows their own sequential task plan.
+            </Text>
+          </View>
 
-        <TouchableOpacity
-          style={
-            styles.editButton
-          }
-          onPress={() =>
-            router.push(
-              '/allocation'
-            )
-          }
-        >
-          <Text
-            style={
-              styles.editButtonText
+          <View style={styles.countBadge}>
+            <Text style={styles.countText}>
+              {activePlannedEmployees.length}
+            </Text>
+          </View>
+        </View>
+
+        {activePlannedEmployees.map((plan) => {
+          const name = employeeName(
+            employees,
+            plan.employeeId
+          );
+
+          const rosterEntry = roster.find(
+            (entry) =>
+              entry.employeeId === plan.employeeId
+          );
+
+          return (
+            <View
+              key={plan.employeeId}
+              style={styles.employeeCard}
+            >
+              <View style={styles.employeeHeader}>
+                <View style={styles.avatar}>
+                  <Text style={styles.avatarText}>
+                    {initials(name)}
+                  </Text>
+                </View>
+
+                <View style={styles.employeeInfo}>
+                  <Text style={styles.employeeName}>
+                    {name}
+                  </Text>
+                  <Text style={styles.employeeShift}>
+                    {rosterEntry?.startTime &&
+                    rosterEntry?.finishTime
+                      ? `${formatClock(
+                          rosterEntry.startTime
+                        )} → ${formatClock(
+                          rosterEntry.finishTime
+                        )}`
+                      : `${formatMinutes(
+                          plan.fullShiftMinutes
+                        )} rostered`}
+                  </Text>
+                </View>
+
+                <Text
+                  style={
+                    plan.overrunMinutes > 0
+                      ? styles.employeeOverrun
+                      : styles.employeeReady
+                  }
+                >
+                  {plan.overrunMinutes > 0
+                    ? `+${formatMinutes(
+                        plan.overrunMinutes
+                      )}`
+                    : 'READY'}
+                </Text>
+              </View>
+
+              <View style={styles.employeeStats}>
+                <StatBox
+                  label="Load start"
+                  value={formatNightMinute(
+                    plan.loadWorkStartMinute
+                  )}
+                />
+                <StatBox
+                  label="Available"
+                  value={formatMinutes(
+                    plan.availableAfterLoadMinutes
+                  )}
+                />
+                <StatBox
+                  label="Allocated"
+                  value={formatMinutes(
+                    plan.allocatedMinutes
+                  )}
+                />
+                <StatBox
+                  label="Remaining"
+                  value={formatMinutes(
+                    plan.remainingMinutes
+                  )}
+                />
+              </View>
+
+              {plan.tasks.map((task, index) => (
+                <View
+                  key={`${task.taskName}-${index}`}
+                  style={styles.employeeTaskRow}
+                >
+                  <View style={styles.taskNumber}>
+                    <Text style={styles.taskNumberText}>
+                      {index + 1}
+                    </Text>
+                  </View>
+
+                  <View style={styles.employeeTaskInfo}>
+                    <Text style={styles.employeeTaskName}>
+                      {task.taskName}
+                    </Text>
+                    <Text style={styles.employeeTaskTime}>
+                      {formatNightMinute(
+                        task.plannedStartMinute
+                      )} → {formatNightMinute(
+                        task.plannedFinishMinute
+                      )}
+                    </Text>
+                  </View>
+
+                  <Text style={styles.employeeTaskDuration}>
+                    {formatMinutes(task.minutes)}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          );
+        })}
+
+        <View style={styles.actionsRow}>
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={() =>
+              router.push('/allocation')
             }
           >
-            Edit Staff Allocation
-          </Text>
-        </TouchableOpacity>
+            <Text style={styles.secondaryButtonText}>
+              Edit Allocation
+            </Text>
+          </TouchableOpacity>
 
-        <TouchableOpacity
-          style={
-            styles.liveButton
-          }
-          onPress={() =>
-            router.push(
-              '/live-progress'
-            )
-          }
-        >
-          <Text
-            style={
-              styles.liveButtonText
+          <TouchableOpacity
+            style={styles.primaryActionButton}
+            onPress={() =>
+              router.push('/live-progress')
+            }
+            disabled={
+              allocations.length === 0
             }
           >
-            Continue to Live Progress →
-          </Text>
-        </TouchableOpacity>
+            <Text style={styles.primaryActionText}>
+              Start Live Progress →
+            </Text>
+          </TouchableOpacity>
+        </View>
       </ScrollView>
     </View>
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| SMALL COMPONENTS
-|--------------------------------------------------------------------------
-*/
-
-function SummaryStat({
+function SummaryRow({
   label,
   value,
-  positive = false,
+  tone,
 }: {
   label: string;
   value: string;
-  positive?: boolean;
+  tone?:
+    | 'primary'
+    | 'good'
+    | 'warning'
+    | 'danger';
 }) {
+  let valueStyle = styles.summaryValue;
+
+  if (tone === 'primary') {
+    valueStyle = styles.summaryPrimary;
+  }
+
+  if (tone === 'good') {
+    valueStyle = styles.summaryGood;
+  }
+
+  if (tone === 'warning') {
+    valueStyle = styles.summaryWarning;
+  }
+
+  if (tone === 'danger') {
+    valueStyle = styles.summaryDanger;
+  }
+
   return (
-    <View
-      style={
-        styles.summaryStat
-      }
-    >
-      <Text
-        style={
-          styles.summaryLabel
-        }
-      >
+    <View style={styles.summaryRow}>
+      <Text style={styles.summaryLabel}>
         {label}
       </Text>
-
-      <Text
-        style={
-          positive
-            ? styles.summaryPositive
-            : styles.summaryValue
-        }
-      >
+      <Text style={valueStyle}>
         {value}
       </Text>
     </View>
   );
 }
 
-function EmployeeStat({
+function StatBox({
   label,
   value,
-  good = false,
 }: {
   label: string;
   value: string;
-  good?: boolean;
 }) {
   return (
-    <View
-      style={
-        styles.employeeStat
-      }
-    >
-      <Text
-        style={
-          styles.employeeStatLabel
-        }
-      >
+    <View style={styles.statBox}>
+      <Text style={styles.statLabel}>
         {label}
       </Text>
-
-      <Text
-        style={
-          good
-            ? styles.employeeStatGood
-            : styles.employeeStatValue
-        }
-      >
+      <Text style={styles.statValue}>
         {value}
       </Text>
     </View>
   );
 }
 
-/*
-|--------------------------------------------------------------------------
-| STYLES
-|--------------------------------------------------------------------------
-*/
-
-const styles =
-  StyleSheet.create({
-    container: {
-      flex: 1,
-      backgroundColor:
-        '#F4F6FA',
-    },
-
-    center: {
-      flex: 1,
-      backgroundColor:
-        '#F4F6FA',
-      alignItems:
-        'center',
-      justifyContent:
-        'center',
-    },
-
-    loadingText: {
-      color:
-        '#667085',
-      fontSize: 13,
-    },
-
-    header: {
-      backgroundColor:
-        '#101D48',
-      paddingTop: 65,
-      paddingHorizontal: 22,
-      paddingBottom: 25,
-    },
-
-    back: {
-      color:
-        '#D5DBED',
-      fontSize: 14,
-      marginBottom: 14,
-    },
-
-    headerSmall: {
-      color:
-        '#AEB9DD',
-      fontSize: 9,
-      fontWeight:
-        '800',
-      letterSpacing: 1.5,
-    },
-
-    title: {
-      color:
-        '#FFFFFF',
-      fontSize: 30,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    subtitle: {
-      color:
-        '#D5DBED',
-      fontSize: 11,
-      marginTop: 4,
-    },
-
-    content: {
-      padding: 16,
-      paddingBottom: 55,
-    },
-
-    sectionTitle: {
-      color:
-        '#101828',
-      fontSize: 17,
-      fontWeight:
-        '800',
-      marginTop: 20,
-      marginBottom: 9,
-    },
-
-    loadCard: {
-      borderRadius: 14,
-      padding: 14,
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-      alignItems:
-        'center',
-    },
-
-    loadArrivedCard: {
-      backgroundColor:
-        '#E8F8EF',
-    },
-
-    loadWaitingCard: {
-      backgroundColor:
-        '#FFF4E5',
-    },
-
-    loadLabel: {
-      color:
-        '#667085',
-      fontSize: 7,
-      fontWeight:
-        '800',
-    },
-
-    loadArrivedText: {
-      color:
-        '#168455',
-      fontSize: 15,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    loadWaitingText: {
-      color:
-        '#B54708',
-      fontSize: 13,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    manageText: {
-      color:
-        '#2436B2',
-      fontSize: 9,
-      fontWeight:
-        '800',
-    },
-
-    warningCard: {
-      backgroundColor:
-        '#FFF4E5',
-      borderRadius: 11,
-      padding: 11,
-      marginTop: 8,
-    },
-
-    warningTitle: {
-      color:
-        '#B54708',
-      fontSize: 10,
-      fontWeight:
-        '800',
-    },
-
-    warningText: {
-      color:
-        '#8A5A19',
-      fontSize: 8,
-      lineHeight: 13,
-      marginTop: 3,
-    },
-
-    summaryCard: {
-      backgroundColor:
-        '#101D48',
-      borderRadius: 14,
-      padding: 14,
-      flexDirection:
-        'row',
-      alignItems:
-        'center',
-    },
-
-    summaryStat: {
-      flex: 1,
-      alignItems:
-        'center',
-    },
-
-    summaryDivider: {
-      width: 1,
-      height: 32,
-      backgroundColor:
-        '#34446E',
-    },
-
-    summaryLabel: {
-      color:
-        '#AEB9DD',
-      fontSize: 7,
-    },
-
-    summaryValue: {
-      color:
-        '#FFFFFF',
-      fontSize: 13,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    summaryPositive: {
-      color:
-        '#8EE1B4',
-      fontSize: 13,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    overallWarning: {
-      backgroundColor:
-        '#FDECEC',
-      borderRadius: 12,
-      padding: 12,
-      marginTop: 9,
-    },
-
-    overallWarningTitle: {
-      color:
-        '#D92D20',
-      fontSize: 11,
-      fontWeight:
-        '800',
-    },
-
-    overallWarningText: {
-      color:
-        '#9F2A20',
-      fontSize: 8,
-      marginTop: 3,
-    },
-
-    emptyCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 14,
-      padding: 16,
-    },
-
-    emptyTitle: {
-      color:
-        '#101828',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    emptyText: {
-      color:
-        '#667085',
-      fontSize: 9,
-      lineHeight: 14,
-      marginTop: 4,
-    },
-
-    employeeCard: {
-      backgroundColor:
-        '#FFFFFF',
-      borderRadius: 16,
-      padding: 14,
-      marginBottom: 11,
-      borderWidth: 1,
-      borderColor:
-        '#FFFFFF',
-    },
-
-    employeeCardOver: {
-      borderColor:
-        '#F4B5AF',
-    },
-
-    employeeHeader: {
-      flexDirection:
-        'row',
-      alignItems:
-        'center',
-    },
-
-    avatar: {
-      width: 42,
-      height: 42,
-      borderRadius: 13,
-      backgroundColor:
-        '#E9ECFF',
-      alignItems:
-        'center',
-      justifyContent:
-        'center',
-    },
-
-    avatarText: {
-      color:
-        '#2436B2',
-      fontSize: 11,
-      fontWeight:
-        '800',
-    },
-
-    employeeInfo: {
-      flex: 1,
-      marginLeft: 10,
-    },
-
-    employeeName: {
-      color:
-        '#101828',
-      fontSize: 13,
-      fontWeight:
-        '800',
-    },
-
-    employeeShift: {
-      color:
-        '#667085',
-      fontSize: 8,
-      marginTop: 3,
-    },
-
-    availableBadge: {
-      backgroundColor:
-        '#E9ECFF',
-      borderRadius: 9,
-      paddingHorizontal: 8,
-      paddingVertical: 6,
-      alignItems:
-        'center',
-    },
-
-    availableBadgeLabel: {
-      color:
-        '#6670A8',
-      fontSize: 5,
-      fontWeight:
-        '800',
-    },
-
-    availableBadgeValue: {
-      color:
-        '#2436B2',
-      fontSize: 9,
-      fontWeight:
-        '800',
-      marginTop: 2,
-    },
-
-    employeeStats: {
-      flexDirection:
-        'row',
-      backgroundColor:
-        '#F8F9FB',
-      borderRadius: 10,
-      marginTop: 11,
-      padding: 9,
-    },
-
-    employeeStat: {
-      flex: 1,
-      alignItems:
-        'center',
-    },
-
-    employeeStatLabel: {
-      color:
-        '#98A2B3',
-      fontSize: 6,
-    },
-
-    employeeStatValue: {
-      color:
-        '#101D48',
-      fontSize: 9,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    employeeStatGood: {
-      color:
-        '#168455',
-      fontSize: 9,
-      fontWeight:
-        '800',
-      marginTop: 3,
-    },
-
-    noTasksBox: {
-      backgroundColor:
-        '#F2F4F7',
-      borderRadius: 9,
-      padding: 10,
-      marginTop: 10,
-    },
-
-    noTasksText: {
-      color:
-        '#667085',
-      fontSize: 8,
-      textAlign:
-        'center',
-    },
-
-    timeline: {
-      marginTop: 13,
-    },
-
-    taskRow: {
-      flexDirection:
-        'row',
-    },
-
-    timelineRail: {
-      width: 20,
-      alignItems:
-        'center',
-    },
-
-    timelineDot: {
-      width: 9,
-      height: 9,
-      borderRadius: 5,
-      backgroundColor:
-        '#2436B2',
-      marginTop: 14,
-      zIndex: 2,
-    },
-
-    timelineDotDanger: {
-      backgroundColor:
-        '#D92D20',
-    },
-
-    timelineLine: {
-      width: 2,
-      flex: 1,
-      backgroundColor:
-        '#D9DDF2',
-      marginTop: -1,
-    },
-
-    taskBox: {
-      flex: 1,
-      backgroundColor:
-        '#F8F9FB',
-      borderRadius: 10,
-      padding: 10,
-      marginBottom: 8,
-    },
-
-    taskBoxOver: {
-      backgroundColor:
-        '#FDECEC',
-    },
-
-    taskTop: {
-      flexDirection:
-        'row',
-      justifyContent:
-        'space-between',
-    },
-
-    taskName: {
-      color:
-        '#101828',
-      fontSize: 10,
-      fontWeight:
-        '800',
-    },
-
-    splittingTask: {
-      color:
-        '#6D5DFB',
-      fontSize: 10,
-      fontWeight:
-        '800',
-    },
-
-    taskDuration: {
-      color:
-        '#667085',
-      fontSize: 8,
-      fontWeight:
-        '700',
-    },
-
-    taskTimes: {
-      color:
-        '#667085',
-      fontSize: 8,
-      marginTop: 4,
-    },
-
-    taskOverText: {
-      color:
-        '#D92D20',
-      fontSize: 7,
-      fontWeight:
-        '800',
-      marginTop: 4,
-    },
-
-    finishBox: {
-      borderRadius: 10,
-      padding: 10,
-      marginTop: 5,
-    },
-
-    finishGood: {
-      backgroundColor:
-        '#E8F8EF',
-    },
-
-    finishDanger: {
-      backgroundColor:
-        '#FDECEC',
-    },
-
-    finishGoodTitle: {
-      color:
-        '#168455',
-      fontSize: 7,
-      fontWeight:
-        '800',
-    },
-
-    finishGoodValue: {
-      color:
-        '#168455',
-      fontSize: 13,
-      fontWeight:
-        '800',
-      marginTop: 2,
-    },
-
-    finishDangerTitle: {
-      color:
-        '#D92D20',
-      fontSize: 7,
-      fontWeight:
-        '800',
-    },
-
-    finishDangerValue: {
-      color:
-        '#D92D20',
-      fontSize: 13,
-      fontWeight:
-        '800',
-      marginTop: 2,
-    },
-
-    finishSmall: {
-      color:
-        '#667085',
-      fontSize: 7,
-      marginTop: 2,
-    },
-
-    editButton: {
-      backgroundColor:
-        '#E9ECFF',
-      borderRadius: 13,
-      paddingVertical: 14,
-      alignItems:
-        'center',
-      marginTop: 8,
-    },
-
-    editButtonText: {
-      color:
-        '#2436B2',
-      fontSize: 10,
-      fontWeight:
-        '800',
-    },
-
-    liveButton: {
-      backgroundColor:
-        '#2436B2',
-      borderRadius: 13,
-      paddingVertical: 14,
-      alignItems:
-        'center',
-      marginTop: 8,
-    },
-
-    liveButtonText: {
-      color:
-        '#FFFFFF',
-      fontSize: 10,
-      fontWeight:
-        '800',
-    },
-  });
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#F4F6FA',
+  },
+  center: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#F4F6FA',
+  },
+  loadingText: {
+    color: '#667085',
+    fontSize: 13,
+  },
+  header: {
+    backgroundColor: '#101D48',
+    paddingTop: 65,
+    paddingHorizontal: 22,
+    paddingBottom: 25,
+  },
+  back: {
+    color: '#D5DBED',
+    fontSize: 14,
+    marginBottom: 13,
+  },
+  headerSmall: {
+    color: '#AEB9DD',
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+  },
+  title: {
+    color: '#FFFFFF',
+    fontSize: 30,
+    fontWeight: '800',
+    marginTop: 4,
+  },
+  subtitle: {
+    color: '#D5DBED',
+    fontSize: 11,
+    marginTop: 4,
+  },
+  content: {
+    padding: 16,
+    paddingBottom: 55,
+  },
+  arrivalCard: {
+    borderRadius: 14,
+    padding: 14,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  arrivalReady: {
+    backgroundColor: '#E8F8EF',
+  },
+  arrivalWaiting: {
+    backgroundColor: '#FFF4E5',
+  },
+  arrivalLabel: {
+    color: '#667085',
+    fontSize: 8,
+    fontWeight: '800',
+  },
+  arrivalReadyText: {
+    color: '#168455',
+    fontSize: 14,
+    fontWeight: '800',
+    marginTop: 3,
+  },
+  arrivalWaitingText: {
+    color: '#B54708',
+    fontSize: 14,
+    fontWeight: '800',
+    marginTop: 3,
+  },
+  manageText: {
+    color: '#2436B2',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  warningCard: {
+    backgroundColor: '#FFF4E5',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 8,
+  },
+  warningTitle: {
+    color: '#B54708',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  warningText: {
+    color: '#8A5A19',
+    fontSize: 9,
+    lineHeight: 14,
+    marginTop: 3,
+  },
+  dangerCard: {
+    backgroundColor: '#FDECEC',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 9,
+  },
+  dangerTitle: {
+    color: '#D92D20',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  dangerText: {
+    color: '#912018',
+    fontSize: 9,
+    lineHeight: 14,
+    marginTop: 3,
+  },
+  sectionTitle: {
+    color: '#101828',
+    fontSize: 17,
+    fontWeight: '800',
+    marginTop: 20,
+    marginBottom: 9,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 20,
+    marginBottom: 9,
+  },
+  sectionTitleNoMargin: {
+    color: '#101828',
+    fontSize: 17,
+    fontWeight: '800',
+  },
+  helperText: {
+    color: '#667085',
+    fontSize: 9,
+    marginTop: 3,
+    maxWidth: 285,
+  },
+  countBadge: {
+    minWidth: 34,
+    height: 34,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+    backgroundColor: '#E9ECFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  countText: {
+    color: '#2436B2',
+    fontWeight: '800',
+  },
+  summaryCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 14,
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 6,
+  },
+  summaryLabel: {
+    color: '#667085',
+    fontSize: 10,
+  },
+  summaryValue: {
+    color: '#101D48',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  summaryPrimary: {
+    color: '#2436B2',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  summaryGood: {
+    color: '#168455',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  summaryWarning: {
+    color: '#B54708',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  summaryDanger: {
+    color: '#D92D20',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  divider: {
+    height: 1,
+    backgroundColor: '#EAECF0',
+    marginVertical: 5,
+  },
+  emptyCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 16,
+  },
+  emptyTitle: {
+    color: '#101828',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  emptyText: {
+    color: '#667085',
+    fontSize: 9,
+    lineHeight: 14,
+    marginTop: 4,
+  },
+  primaryButton: {
+    backgroundColor: '#2436B2',
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  primaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  teamTaskCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 8,
+  },
+  teamTaskTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+  teamTaskInfo: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  teamTaskName: {
+    color: '#101828',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  teamNames: {
+    color: '#667085',
+    fontSize: 9,
+    lineHeight: 14,
+    marginTop: 3,
+  },
+  staffBadge: {
+    backgroundColor: '#EEF2FF',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  staffBadgeText: {
+    color: '#2436B2',
+    fontSize: 8,
+    fontWeight: '800',
+  },
+  timelineBox: {
+    backgroundColor: '#F4F6FA',
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 10,
+  },
+  timelineClock: {
+    color: '#101D48',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  timelineMeta: {
+    color: '#667085',
+    fontSize: 9,
+    marginTop: 3,
+  },
+  employeeCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 15,
+    padding: 14,
+    marginBottom: 10,
+  },
+  employeeHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  avatar: {
+    width: 42,
+    height: 42,
+    borderRadius: 13,
+    backgroundColor: '#101D48',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  employeeInfo: {
+    flex: 1,
+    marginLeft: 10,
+  },
+  employeeName: {
+    color: '#101828',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  employeeShift: {
+    color: '#667085',
+    fontSize: 9,
+    marginTop: 3,
+  },
+  employeeReady: {
+    color: '#168455',
+    fontSize: 8,
+    fontWeight: '800',
+  },
+  employeeOverrun: {
+    color: '#D92D20',
+    fontSize: 9,
+    fontWeight: '800',
+  },
+  employeeStats: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 7,
+    marginTop: 12,
+    marginBottom: 10,
+  },
+  statBox: {
+    width: '48.5%',
+    backgroundColor: '#F4F6FA',
+    borderRadius: 10,
+    padding: 9,
+  },
+  statLabel: {
+    color: '#98A2B3',
+    fontSize: 8,
+  },
+  statValue: {
+    color: '#101D48',
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 3,
+  },
+  employeeTaskRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderTopWidth: 1,
+    borderTopColor: '#EAECF0',
+    paddingVertical: 10,
+  },
+  taskNumber: {
+    width: 26,
+    height: 26,
+    borderRadius: 8,
+    backgroundColor: '#EEF2FF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  taskNumberText: {
+    color: '#2436B2',
+    fontSize: 9,
+    fontWeight: '800',
+  },
+  employeeTaskInfo: {
+    flex: 1,
+    marginLeft: 9,
+  },
+  employeeTaskName: {
+    color: '#101828',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  employeeTaskTime: {
+    color: '#667085',
+    fontSize: 8,
+    marginTop: 2,
+  },
+  employeeTaskDuration: {
+    color: '#2436B2',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  actionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 12,
+  },
+  secondaryButton: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#D7DDFE',
+  },
+  secondaryButtonText: {
+    color: '#2436B2',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  primaryActionButton: {
+    flex: 1.3,
+    backgroundColor: '#2436B2',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  primaryActionText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+});
