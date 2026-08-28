@@ -40,35 +40,13 @@ export default function SettingsScreen() {
       >
         <Text style={styles.sectionTitle}>Security & Compliance</Text>
 
-        <TouchableOpacity
-          style={styles.settingCard}
+        <SettingCard
+          title="Manager PIN"
+          subtitle="Lock roster, employee and performance information behind manager access"
           onPress={() => router.push('/manager-security')}
-        >
-          <View style={styles.settingInfo}>
-            <View style={styles.titleRow}>
-              <Text style={styles.settingTitle}>Manager PIN</Text>
-              <View
-                style={[
-                  styles.statusBadge,
-                  pinEnabled ? styles.enabledBadge : styles.warningBadge,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.statusText,
-                    pinEnabled ? styles.enabledText : styles.warningText,
-                  ]}
-                >
-                  {pinEnabled ? 'ON' : 'OFF'}
-                </Text>
-              </View>
-            </View>
-            <Text style={styles.settingSubtitle}>
-              Lock roster, employee and performance information behind manager access
-            </Text>
-          </View>
-          <Text style={styles.arrow}>›</Text>
-        </TouchableOpacity>
+          badge={pinEnabled ? 'ON' : 'OFF'}
+          badgeTone={pinEnabled ? 'good' : 'warning'}
+        />
 
         {pinEnabled ? (
           <TouchableOpacity
@@ -82,34 +60,22 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         ) : null}
 
-        <TouchableOpacity
-          style={styles.settingCard}
+        <SettingCard
+          title="Audit Log"
+          subtitle="Review manager security, compliance and key operational changes"
           onPress={() => router.push('/audit-log')}
-        >
-          <View style={styles.settingInfo}>
-            <Text style={styles.settingTitle}>Audit Log</Text>
-            <Text style={styles.settingSubtitle}>
-              Review manager security, compliance and key operational changes
-            </Text>
-          </View>
-          <Text style={styles.arrow}>›</Text>
-        </TouchableOpacity>
+        />
 
-        <TouchableOpacity
-          style={styles.settingCard}
+        <SettingCard
+          title="Privacy & Responsible AI"
+          subtitle="Manager review, data minimisation and safe-use principles"
           onPress={() => router.push('/privacy-ai')}
-        >
-          <View style={styles.settingInfo}>
-            <Text style={styles.settingTitle}>Privacy & Responsible AI</Text>
-            <Text style={styles.settingSubtitle}>
-              Manager review, data minimisation and safe-use principles
-            </Text>
-          </View>
-          <Text style={styles.arrow}>›</Text>
-        </TouchableOpacity>
+        />
 
         <View style={styles.aiNotice}>
-          <Text style={styles.aiNoticeTitle}>Smart Allocation remains manager-controlled</Text>
+          <Text style={styles.aiNoticeTitle}>
+            Smart Allocation remains manager-controlled
+          </Text>
           <Text style={styles.aiNoticeText}>
             AI-style suggestions are never final automatically. The manager can change employee, aisle, minutes and start times before the plan is used.
           </Text>
@@ -117,18 +83,17 @@ export default function SettingsScreen() {
 
         <Text style={styles.sectionTitle}>Nightfill Setup</Text>
 
-        <TouchableOpacity
-          style={styles.settingCard}
+        <SettingCard
+          title="Night Captain"
+          subtitle="Choose Captain working nights and the default 6 PM–3 AM shift"
           onPress={() => router.push('/night-captain-settings')}
-        >
-          <View style={styles.settingInfo}>
-            <Text style={styles.settingTitle}>Night Captain</Text>
-            <Text style={styles.settingSubtitle}>
-              Choose Captain working nights and the default 6 PM–3 AM shift
-            </Text>
-          </View>
-          <Text style={styles.arrow}>›</Text>
-        </TouchableOpacity>
+        />
+
+        <SettingCard
+          title="Break Rules"
+          subtitle="Configure paid and meal breaks used in productive labour calculations"
+          onPress={() => router.push('/break-rules')}
+        />
 
         <SettingCard
           title="Grocery Aisles"
@@ -137,10 +102,6 @@ export default function SettingsScreen() {
         <SettingCard
           title="Default Shift Times"
           subtitle="Set common grocery nightfill start and finish times"
-        />
-        <SettingCard
-          title="Break Rules"
-          subtitle="Configure paid and unpaid breaks"
         />
 
         <Text style={styles.sectionTitle}>Load Management</Text>
@@ -182,21 +143,60 @@ export default function SettingsScreen() {
 
         <View style={styles.versionCard}>
           <Text style={styles.versionTitle}>Grocery Nightfill</Text>
-          <Text style={styles.versionText}>Version 0.2 · Manager prototype</Text>
+          <Text style={styles.versionText}>Version 0.3 · Manager prototype</Text>
         </View>
       </ScrollView>
     </View>
   );
 }
 
-function SettingCard({ title, subtitle }: { title: string; subtitle: string }) {
+function SettingCard({
+  title,
+  subtitle,
+  onPress,
+  badge,
+  badgeTone,
+}: {
+  title: string;
+  subtitle: string;
+  onPress?: () => void;
+  badge?: string;
+  badgeTone?: 'good' | 'warning';
+}) {
   return (
-    <TouchableOpacity style={styles.settingCard}>
+    <TouchableOpacity
+      style={styles.settingCard}
+      onPress={onPress}
+      disabled={!onPress}
+    >
       <View style={styles.settingInfo}>
-        <Text style={styles.settingTitle}>{title}</Text>
+        <View style={styles.titleRow}>
+          <Text style={styles.settingTitle}>{title}</Text>
+          {badge ? (
+            <View
+              style={[
+                styles.statusBadge,
+                badgeTone === 'good'
+                  ? styles.enabledBadge
+                  : styles.warningBadge,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.statusText,
+                  badgeTone === 'good'
+                    ? styles.enabledText
+                    : styles.warningText,
+                ]}
+              >
+                {badge}
+              </Text>
+            </View>
+          ) : null}
+        </View>
         <Text style={styles.settingSubtitle}>{subtitle}</Text>
       </View>
-      <Text style={styles.arrow}>›</Text>
+      <Text style={styles.arrow}>{onPress ? '›' : '·'}</Text>
     </TouchableOpacity>
   );
 }
