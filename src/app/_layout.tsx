@@ -1,8 +1,16 @@
 import { Ionicons } from '@expo/vector-icons';
 import { Tabs } from 'expo-router';
+import { useEffect } from 'react';
 import ManagerGate from '../components/manager-gate';
+import { seedProvidedWeeklyRoster } from '../utils/providedRosterSeed';
 
 export default function RootLayout() {
+  useEffect(() => {
+    seedProvidedWeeklyRoster().catch((error) => {
+      console.log('SEED PROVIDED ROSTER ERROR:', error);
+    });
+  }, []);
+
   return (
     <ManagerGate>
       <Tabs
