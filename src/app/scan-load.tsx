@@ -1,20 +1,28 @@
 import { router } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
 
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import * as ImagePicker from 'expo-image-picker';
 
 import {
-    Alert,
-    Image,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  Alert,
+  Image,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
+
+import { formatMinutes } from '../utils/nightfillPlanning';
+import {
+  getTonightContext,
+  migrateLegacyNightValue,
+  NIGHTFILL_STORAGE,
+  readNightValue,
+  saveNightValue,
+} from '../utils/nightfillStorage';
 
 type LoadItem = {
   name: string;
@@ -50,24 +58,19 @@ type OCRValidation = {
 
 type NightLoad = {
   day: string;
+  dateKey?: string;
   photos: string[];
   items: LoadItem[];
-
   totalCartons: number;
-
   totalRequiredMinutes: number;
   aisleMinutes: number;
   promoMinutes: number;
   protectMinutes: number;
-
   splittingMinutes: number;
   splittingHours: string;
   splittingMinuteInput: string;
-
   otherOrganisingMinutes: number;
-
   totalWasDetected: boolean;
-
   updatedAt: string;
 };
 
@@ -99,29 +102,14 @@ function createInitialItems(): LoadItem[] {
   }));
 }
 
-function getNightfillDate() {
-  const now = new Date();
-  const nightfillDate = new Date(now);
+function getBackendUrl() {
+  const configuredUrl =
+    process.env.EXPO_PUBLIC_API_URL?.trim();
 
-  if (nightfillDate.getHours() < 5) {
-    nightfillDate.setDate(
-      nightfillDate.getDate() - 1
-    );
+  if (configuredUrl) {
+    return configuredUrl.replace(/\/+$/, '');
   }
 
-  return nightfillDate;
-}
-
-function getNightfillDay() {
-  return getNightfillDate().toLocaleDateString(
-    'en-AU',
-    {
-      weekday: 'long',
-    }
-  );
-}
-
-function getBackendUrl() {
   const hostUri =
     Constants.expoConfig?.hostUri;
 
@@ -135,33 +123,18 @@ function getBackendUrl() {
   return `http://${host}:4000`;
 }
 
-function formatMinutes(
-  totalMinutes: number
-) {
-  const safeMinutes =
-    Math.max(
-      Math.round(totalMinutes || 0),
-      0
-    );
-
-  const hours =
-    Math.floor(
-      safeMinutes / 60
-    );
-
-  const minutes =
-    safeMinutes % 60;
-
-  if (hours === 0) {
-    return `${minutes}m`;
-  }
-
-  return `${hours}h ${minutes}m`;
-}
-
 export default function ScanLoadScreen() {
+  const nightContext =
+    useMemo(
+      () => getTonightContext(),
+      []
+    );
+
   const nightfillDay =
-    getNightfillDay();
+    nightContext.dayName;
+
+  const dateKey =
+    nightContext.dateKey;
 
   const backendUrl =
     useMemo(
@@ -186,39 +159,20 @@ export default function ScanLoadScreen() {
   const [analyzing, setAnalyzing] =
     useState(false);
 
-  const [
-    lastDetectedCount,
-    setLastDetectedCount,
-  ] = useState(0);
+  const [lastDetectedCount, setLastDetectedCount] =
+    useState(0);
 
-  const [
-    ocrTotals,
-    setOcrTotals,
-  ] = useState<OCRTotals | null>(
-    null
-  );
+  const [ocrTotals, setOcrTotals] =
+    useState<OCRTotals | null>(null);
 
-  const [
-    validation,
-    setValidation,
-  ] =
-    useState<OCRValidation | null>(
-      null
-    );
+  const [validation, setValidation] =
+    useState<OCRValidation | null>(null);
 
-  /*
-   * SPLITTING IS EDITABLE
-   */
+  const [splittingHours, setSplittingHours] =
+    useState('');
 
-  const [
-    splittingHours,
-    setSplittingHours,
-  ] = useState('');
-
-  const [
-    splittingMinutesInput,
-    setSplittingMinutesInput,
-  ] = useState('');
+  const [splittingMinutesInput, setSplittingMinutesInput] =
+    useState('');
 
   useEffect(() => {
     loadExistingLoad();
@@ -226,35 +180,30 @@ export default function ScanLoadScreen() {
 
   async function loadExistingLoad() {
     try {
-      const stored =
-        await AsyncStorage.getItem(
-          'groceryNightLoads'
-        );
-
-      if (!stored) {
-        return;
-      }
-
-      const loads: Record<
-        string,
-        NightLoad
-      > = JSON.parse(stored);
+      /*
+       * If this device still only has an old weekday record,
+       * archive it under tonight's permanent YYYY-MM-DD key first.
+       */
+      await migrateLegacyNightValue<NightLoad>(
+        NIGHTFILL_STORAGE.loads,
+        dateKey,
+        nightfillDay
+      );
 
       const existing =
-        loads[nightfillDay];
+        await readNightValue<NightLoad>(
+          NIGHTFILL_STORAGE.loads,
+          dateKey,
+          nightfillDay
+        );
 
       if (!existing) {
         return;
       }
 
-      setPhotos(
-        existing.photos || []
-      );
+      setPhotos(existing.photos || []);
 
-      if (
-        existing.items &&
-        existing.items.length > 0
-      ) {
+      if (existing.items?.length) {
         const merged =
           createInitialItems().map(
             (defaultItem) => {
@@ -286,42 +235,27 @@ export default function ScanLoadScreen() {
 
       setSplittingMinutesInput(
         existing.splittingMinuteInput ??
-          String(
-            existingSplitting % 60
-          )
+          String(existingSplitting % 60)
       );
 
       setOcrTotals({
-        cartons:
-          existing.totalCartons || 0,
-
+        cartons: existing.totalCartons || 0,
         totalRequiredMinutes:
-          existing.totalRequiredMinutes ||
-          0,
-
+          existing.totalRequiredMinutes || 0,
         totalRequiredHours:
-          (existing.totalRequiredMinutes ||
-            0) / 60,
-
+          (existing.totalRequiredMinutes || 0) / 60,
         totalWasDetected:
-          existing.totalWasDetected ||
-          false,
-
+          existing.totalWasDetected || false,
         aisleMinutes:
           existing.aisleMinutes || 0,
-
         promoMinutes:
           existing.promoMinutes || 0,
-
         protectMinutes:
           existing.protectMinutes || 0,
-
         splittingMinutes:
           existingSplitting,
-
         otherOrganisingMinutes:
-          existing.otherOrganisingMinutes ||
-          0,
+          existing.otherOrganisingMinutes || 0,
       });
     } catch (error) {
       console.log(
@@ -343,7 +277,6 @@ export default function ScanLoadScreen() {
           'Camera Permission Required',
           'Please allow camera access.'
         );
-
         return;
       }
 
@@ -362,16 +295,11 @@ export default function ScanLoadScreen() {
           ...previous,
           result.assets[0].uri,
         ]);
-
         setLastDetectedCount(0);
         setValidation(null);
       }
     } catch (error) {
-      console.log(
-        'CAMERA ERROR:',
-        error
-      );
-
+      console.log('CAMERA ERROR:', error);
       Alert.alert(
         'Camera Error',
         'Could not open the camera.'
@@ -389,7 +317,6 @@ export default function ScanLoadScreen() {
           'Photo Permission Required',
           'Please allow access to your photos.'
         );
-
         return;
       }
 
@@ -407,25 +334,19 @@ export default function ScanLoadScreen() {
       ) {
         const newPhotos =
           result.assets.map(
-            (
-              asset: ImagePicker.ImagePickerAsset
-            ) => asset.uri
+            (asset: ImagePicker.ImagePickerAsset) =>
+              asset.uri
           );
 
         setPhotos((previous) => [
           ...previous,
           ...newPhotos,
         ]);
-
         setLastDetectedCount(0);
         setValidation(null);
       }
     } catch (error) {
-      console.log(
-        'GALLERY ERROR:',
-        error
-      );
-
+      console.log('GALLERY ERROR:', error);
       Alert.alert(
         'Gallery Error',
         'Could not open your photos.'
@@ -433,9 +354,7 @@ export default function ScanLoadScreen() {
     }
   }
 
-  function removePhoto(
-    index: number
-  ) {
+  function removePhoto(index: number) {
     Alert.alert(
       'Remove Photo',
       'Remove this Fill Assist photo?',
@@ -454,7 +373,6 @@ export default function ScanLoadScreen() {
                   photoIndex !== index
               )
             );
-
             setLastDetectedCount(0);
             setValidation(null);
           },
@@ -469,7 +387,6 @@ export default function ScanLoadScreen() {
         'No Photos',
         'Take or select Fill Assist photos first.'
       );
-
       return;
     }
 
@@ -480,16 +397,12 @@ export default function ScanLoadScreen() {
         new FormData();
 
       photos.forEach(
-        (
-          photoUri,
-          index
-        ) => {
+        (photoUri, index) => {
           const extension =
             photoUri
               .split('.')
               .pop()
-              ?.toLowerCase() ||
-            'jpg';
+              ?.toLowerCase() || 'jpg';
 
           const mimeType =
             extension === 'png'
@@ -500,8 +413,7 @@ export default function ScanLoadScreen() {
             'photos',
             {
               uri: photoUri,
-              name:
-                `fill-assist-${index}.${extension}`,
+              name: `fill-assist-${index}.${extension}`,
               type: mimeType,
             } as any
           );
@@ -534,16 +446,12 @@ export default function ScanLoadScreen() {
         );
       }
 
-      const detected:
-        DetectedItem[] =
-        Array.isArray(
-          data.detected
-        )
+      const detected: DetectedItem[] =
+        Array.isArray(data.detected)
           ? data.detected
           : [];
 
-      const totals:
-        OCRTotals =
+      const totals: OCRTotals =
         data.totals || {
           cartons: 0,
           totalRequiredMinutes: 0,
@@ -556,28 +464,22 @@ export default function ScanLoadScreen() {
           otherOrganisingMinutes: 0,
         };
 
-      setOcrTotals(
-        totals
-      );
+      setOcrTotals(totals);
 
       /*
-       * OCR PREFILLS SPLITTING,
-       * BUT MANAGER CAN EDIT IT.
+       * OCR prefills splitting, but the manager remains in control.
        */
-
       setSplittingHours(
         String(
           Math.floor(
-            totals.splittingMinutes /
-              60
+            totals.splittingMinutes / 60
           )
         )
       );
 
       setSplittingMinutesInput(
         String(
-          totals.splittingMinutes %
-            60
+          totals.splittingMinutes % 60
         )
       );
 
@@ -586,47 +488,38 @@ export default function ScanLoadScreen() {
       );
 
       setItems((previous) =>
-        previous.map(
-          (existingItem) => {
-            const detectedItem =
-              detected.find(
-                (item) =>
-                  item.name ===
-                  existingItem.name
-              );
+        previous.map((existingItem) => {
+          const detectedItem =
+            detected.find(
+              (item) =>
+                item.name ===
+                existingItem.name
+            );
 
-            if (!detectedItem) {
-              return existingItem;
-            }
-
-            return {
-              ...existingItem,
-
-              cartons:
-                detectedItem.cartons > 0
-                  ? String(
-                      detectedItem.cartons
-                    )
-                  : existingItem.cartons,
-
-              hours:
-                detectedItem.hours > 0 ||
-                detectedItem.minutes > 0
-                  ? String(
-                      detectedItem.hours
-                    )
-                  : existingItem.hours,
-
-              minutes:
-                detectedItem.hours > 0 ||
-                detectedItem.minutes > 0
-                  ? String(
-                      detectedItem.minutes
-                    )
-                  : existingItem.minutes,
-            };
+          if (!detectedItem) {
+            return existingItem;
           }
-        )
+
+          const hasDetectedTime =
+            detectedItem.hours > 0 ||
+            detectedItem.minutes > 0;
+
+          return {
+            ...existingItem,
+            cartons:
+              detectedItem.cartons > 0
+                ? String(detectedItem.cartons)
+                : existingItem.cartons,
+            hours:
+              hasDetectedTime
+                ? String(detectedItem.hours)
+                : existingItem.hours,
+            minutes:
+              hasDetectedTime
+                ? String(detectedItem.minutes)
+                : existingItem.minutes,
+          };
+        })
       );
 
       setLastDetectedCount(
@@ -657,21 +550,17 @@ export default function ScanLoadScreen() {
 
   function updateItem(
     index: number,
-    field:
-      | 'cartons'
-      | 'hours'
-      | 'minutes',
+    field: 'cartons' | 'hours' | 'minutes',
     value: string
   ) {
     setItems((previous) =>
-      previous.map(
-        (item, itemIndex) =>
-          itemIndex === index
-            ? {
-                ...item,
-                [field]: value,
-              }
-            : item
+      previous.map((item, itemIndex) =>
+        itemIndex === index
+          ? {
+              ...item,
+              [field]: value,
+            }
+          : item
       )
     );
   }
@@ -688,85 +577,56 @@ export default function ScanLoadScreen() {
     activeItems.reduce(
       (total, item) =>
         total +
-        (Number(item.cartons) ||
-          0),
+        (Number(item.cartons) || 0),
       0
     );
 
   const currentAisleMinutes =
     items
-      .filter(
-        (item) =>
-          item.name.startsWith(
-            'Aisle '
-          )
+      .filter((item) =>
+        item.name.startsWith('Aisle ')
       )
       .reduce(
         (total, item) =>
           total +
-          (Number(item.hours) ||
-            0) *
-            60 +
-          (Number(item.minutes) ||
-            0),
+          (Number(item.hours) || 0) * 60 +
+          (Number(item.minutes) || 0),
         0
       );
 
   const promoItem =
     items.find(
-      (item) =>
-        item.name === 'Promo'
+      (item) => item.name === 'Promo'
     );
 
   const currentPromoMinutes =
     promoItem
-      ? (Number(
-          promoItem.hours
-        ) || 0) *
-          60 +
-        (Number(
-          promoItem.minutes
-        ) || 0)
+      ? (Number(promoItem.hours) || 0) * 60 +
+        (Number(promoItem.minutes) || 0)
       : 0;
 
   const protectItem =
     items.find(
       (item) =>
-        item.name ===
-        'Protect - Aisle'
+        item.name === 'Protect - Aisle'
     );
 
   const currentProtectMinutes =
     protectItem
-      ? (Number(
-          protectItem.hours
-        ) || 0) *
-          60 +
-        (Number(
-          protectItem.minutes
-        ) || 0)
+      ? (Number(protectItem.hours) || 0) * 60 +
+        (Number(protectItem.minutes) || 0)
       : 0;
 
-  /*
-   * MANAGER-EDITED SPLITTING
-   */
-
   const editableSplittingMinutes =
-    (Number(
-      splittingHours
-    ) || 0) *
-      60 +
-    (Number(
-      splittingMinutesInput
-    ) || 0);
+    (Number(splittingHours) || 0) * 60 +
+    (Number(splittingMinutesInput) || 0);
 
   /*
-   * PRINTED TOTAL FROM FILL ASSIST
+   * Fill Assist printed total remains the master load requirement.
+   * Splitting is already part of that total and is never subtracted twice.
    */
-
   const totalRequiredMinutes =
-    ocrTotals
-      ?.totalRequiredMinutes ||
+    ocrTotals?.totalRequiredMinutes ||
     (
       currentAisleMinutes +
       currentPromoMinutes +
@@ -793,37 +653,27 @@ export default function ScanLoadScreen() {
 
   async function saveLoad() {
     const splittingMinuteNumber =
-      Number(
-        splittingMinutesInput
-      ) || 0;
+      Number(splittingMinutesInput) || 0;
 
-    if (
-      splittingMinuteNumber >= 60
-    ) {
+    if (splittingMinuteNumber >= 60) {
       Alert.alert(
         'Check Splitting',
         'Splitting minutes must be between 0 and 59.'
       );
-
       return;
     }
 
     const invalidAisleMinutes =
       items.some(
         (item) =>
-          Number(
-            item.minutes
-          ) >= 60
+          Number(item.minutes) >= 60
       );
 
-    if (
-      invalidAisleMinutes
-    ) {
+    if (invalidAisleMinutes) {
       Alert.alert(
         'Check Aisle Time',
         'Minutes must be between 0 and 59.'
       );
-
       return;
     }
 
@@ -832,78 +682,48 @@ export default function ScanLoadScreen() {
         'Labour Does Not Match',
         'Aisle, Promo, Protect and Splitting time are greater than the Fill Assist total. Please review the values.'
       );
-
       return;
     }
 
     try {
       setSaving(true);
 
-      const nightLoad:
-        NightLoad = {
-        day:
-          nightfillDay,
-
+      const nightLoad: NightLoad = {
+        day: nightfillDay,
+        dateKey,
         photos,
-
         items,
-
-        totalCartons:
-          currentTotalCartons,
-
+        totalCartons: currentTotalCartons,
         totalRequiredMinutes,
-
-        aisleMinutes:
-          currentAisleMinutes,
-
-        promoMinutes:
-          currentPromoMinutes,
-
-        protectMinutes:
-          currentProtectMinutes,
-
-        splittingMinutes:
-          editableSplittingMinutes,
-
+        aisleMinutes: currentAisleMinutes,
+        promoMinutes: currentPromoMinutes,
+        protectMinutes: currentProtectMinutes,
+        splittingMinutes: editableSplittingMinutes,
         splittingHours,
-
         splittingMinuteInput:
           splittingMinutesInput,
-
         otherOrganisingMinutes,
-
         totalWasDetected:
-          ocrTotals
-            ?.totalWasDetected ||
-          false,
-
+          ocrTotals?.totalWasDetected || false,
         updatedAt:
           new Date().toISOString(),
       };
 
-      const existing =
-        await AsyncStorage.getItem(
-          'groceryNightLoads'
-        );
-
-      const loads: Record<
-        string,
-        NightLoad
-      > = existing
-        ? JSON.parse(existing)
-        : {};
-
-      loads[nightfillDay] =
-        nightLoad;
-
-      await AsyncStorage.setItem(
-        'groceryNightLoads',
-        JSON.stringify(loads)
+      /*
+       * Permanent archive: YYYY-MM-DD.
+       * Temporary compatibility mirror: weekday.
+       * The weekday mirror can be removed after every reader is migrated.
+       */
+      await saveNightValue(
+        NIGHTFILL_STORAGE.loads,
+        dateKey,
+        nightLoad,
+        nightfillDay
       );
 
       Alert.alert(
         'Load Saved',
-        `Total Required: ${formatMinutes(
+        `Night: ${dateKey}\nTotal Required: ${formatMinutes(
           totalRequiredMinutes
         )}\nSplitting: ${formatMinutes(
           editableSplittingMinutes
@@ -947,9 +767,7 @@ export default function ScanLoadScreen() {
     <View style={styles.container}>
       <View style={styles.header}>
         <TouchableOpacity
-          onPress={() =>
-            router.back()
-          }
+          onPress={() => router.back()}
         >
           <Text style={styles.back}>
             ‹ Tonight
@@ -961,38 +779,27 @@ export default function ScanLoadScreen() {
         </Text>
 
         <Text style={styles.subtitle}>
-          {nightfillDay} Nightfill · 5 PM–5 AM
+          {nightfillDay} · {dateKey} · 5 PM–5 AM
         </Text>
       </View>
 
       <ScrollView
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
-        contentContainerStyle={
-          styles.content
-        }
+        contentContainerStyle={styles.content}
       >
         <View style={styles.sectionHeader}>
           <View>
-            <Text
-              style={
-                styles.sectionTitleNoMargin
-              }
-            >
+            <Text style={styles.sectionTitleNoMargin}>
               Fill Assist Photos
             </Text>
-
             <Text style={styles.sectionSubtitle}>
               Include the top summary, splitting and aisle screens
             </Text>
           </View>
 
           <View style={styles.photoCount}>
-            <Text
-              style={
-                styles.photoCountText
-              }
-            >
+            <Text style={styles.photoCountText}>
               {photos.length}
             </Text>
           </View>
@@ -1003,11 +810,9 @@ export default function ScanLoadScreen() {
             <Text style={styles.cameraEmoji}>
               📷
             </Text>
-
             <Text style={styles.emptyPhotoTitle}>
               Add Fill Assist Photos
             </Text>
-
             <Text style={styles.emptyPhotoText}>
               Take enough photos to capture the total, splitting and all grocery sections.
             </Text>
@@ -1016,89 +821,54 @@ export default function ScanLoadScreen() {
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
-            contentContainerStyle={
-              styles.photosRow
-            }
+            contentContainerStyle={styles.photosRow}
           >
-            {photos.map(
-              (
-                photo,
-                index
-              ) => (
-                <View
-                  key={`${photo}-${index}`}
-                  style={
-                    styles.photoWrapper
+            {photos.map((photo, index) => (
+              <View
+                key={`${photo}-${index}`}
+                style={styles.photoWrapper}
+              >
+                <Image
+                  source={{ uri: photo }}
+                  style={styles.photo}
+                />
+
+                <View style={styles.photoNumber}>
+                  <Text style={styles.photoNumberText}>
+                    {index + 1}
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  style={styles.removePhoto}
+                  onPress={() =>
+                    removePhoto(index)
                   }
                 >
-                  <Image
-                    source={{
-                      uri: photo,
-                    }}
-                    style={styles.photo}
-                  />
-
-                  <View style={styles.photoNumber}>
-                    <Text
-                      style={
-                        styles.photoNumberText
-                      }
-                    >
-                      {index + 1}
-                    </Text>
-                  </View>
-
-                  <TouchableOpacity
-                    style={
-                      styles.removePhoto
-                    }
-                    onPress={() =>
-                      removePhoto(
-                        index
-                      )
-                    }
-                  >
-                    <Text
-                      style={
-                        styles.removePhotoText
-                      }
-                    >
-                      ×
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              )
-            )}
+                  <Text style={styles.removePhotoText}>
+                    ×
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            ))}
           </ScrollView>
         )}
 
         <View style={styles.photoButtons}>
           <TouchableOpacity
-            style={
-              styles.cameraButton
-            }
+            style={styles.cameraButton}
             onPress={takePhoto}
           >
-            <Text
-              style={
-                styles.cameraButtonText
-              }
-            >
+            <Text style={styles.cameraButtonText}>
               📷 Take Photo
             </Text>
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={
-              styles.galleryButton
-            }
+            style={styles.galleryButton}
             onPress={choosePhotos}
           >
-            <Text
-              style={
-                styles.galleryButtonText
-              }
-            >
+            <Text style={styles.galleryButtonText}>
               Gallery
             </Text>
           </TouchableOpacity>
@@ -1107,12 +877,10 @@ export default function ScanLoadScreen() {
         <TouchableOpacity
           style={[
             styles.analyzeButton,
-
             (
               analyzing ||
               photos.length === 0
-            ) &&
-              styles.disabledButton,
+            ) && styles.disabledButton,
           ]}
           disabled={
             analyzing ||
@@ -1120,11 +888,7 @@ export default function ScanLoadScreen() {
           }
           onPress={analyzePhotos}
         >
-          <Text
-            style={
-              styles.analyzeButtonText
-            }
-          >
+          <Text style={styles.analyzeButtonText}>
             {analyzing
               ? 'Analyzing Fill Assist...'
               : '✨ Analyze Fill Assist Automatically'}
@@ -1132,28 +896,18 @@ export default function ScanLoadScreen() {
         </TouchableOpacity>
 
         {lastDetectedCount > 0 && (
-          <View
-            style={
-              styles.detectedBanner
-            }
-          >
-            <Text
-              style={
-                styles.detectedText
-              }
-            >
+          <View style={styles.detectedBanner}>
+            <Text style={styles.detectedText}>
               ✓ {lastDetectedCount} sections detected
             </Text>
           </View>
         )}
 
-        {validation
-          ?.possibleOCRProblem && (
+        {validation?.possibleOCRProblem && (
           <View style={styles.warningCard}>
             <Text style={styles.warningTitle}>
               ⚠ Check OCR Values
             </Text>
-
             <Text style={styles.warningText}>
               {validation.message}
             </Text>
@@ -1166,38 +920,20 @@ export default function ScanLoadScreen() {
 
         <View style={styles.masterTotalCard}>
           <View>
-            <Text
-              style={
-                styles.masterTotalLabel
-              }
-            >
+            <Text style={styles.masterTotalLabel}>
               TOTAL REQUIRED
             </Text>
-
-            <Text
-              style={
-                styles.masterTotalSubtext
-              }
-            >
-              {ocrTotals
-                ?.totalWasDetected
+            <Text style={styles.masterTotalSubtext}>
+              {ocrTotals?.totalWasDetected
                 ? 'Read from Fill Assist'
                 : 'Estimated'}
             </Text>
           </View>
 
-          <Text
-            style={
-              styles.masterTotalValue
-            }
-          >
-            {formatMinutes(
-              totalRequiredMinutes
-            )}
+          <Text style={styles.masterTotalValue}>
+            {formatMinutes(totalRequiredMinutes)}
           </Text>
         </View>
-
-        {/* EDITABLE SPLITTING */}
 
         <View style={styles.splittingCard}>
           <View style={styles.splittingHeader}>
@@ -1205,16 +941,13 @@ export default function ScanLoadScreen() {
               <Text style={styles.splittingTitle}>
                 Splitting
               </Text>
-
               <Text style={styles.splittingSubtitle}>
                 OCR detected this value. Adjust it if required.
               </Text>
             </View>
 
             <Text style={styles.splittingTotal}>
-              {formatMinutes(
-                editableSplittingMinutes
-              )}
+              {formatMinutes(editableSplittingMinutes)}
             </Text>
           </View>
 
@@ -1223,18 +956,11 @@ export default function ScanLoadScreen() {
               <TextInput
                 style={styles.splittingInput}
                 value={splittingHours}
-                onChangeText={
-                  setSplittingHours
-                }
+                onChangeText={setSplittingHours}
                 keyboardType="number-pad"
                 placeholder="0"
               />
-
-              <Text
-                style={
-                  styles.splittingSuffix
-                }
-              >
+              <Text style={styles.splittingSuffix}>
                 hours
               </Text>
             </View>
@@ -1242,22 +968,13 @@ export default function ScanLoadScreen() {
             <View style={styles.splittingInputBox}>
               <TextInput
                 style={styles.splittingInput}
-                value={
-                  splittingMinutesInput
-                }
-                onChangeText={
-                  setSplittingMinutesInput
-                }
+                value={splittingMinutesInput}
+                onChangeText={setSplittingMinutesInput}
                 keyboardType="number-pad"
                 maxLength={2}
                 placeholder="0"
               />
-
-              <Text
-                style={
-                  styles.splittingSuffix
-                }
-              >
+              <Text style={styles.splittingSuffix}>
                 min
               </Text>
             </View>
@@ -1269,11 +986,8 @@ export default function ScanLoadScreen() {
             <Text style={styles.bucketLabel}>
               Aisle Fill
             </Text>
-
             <Text style={styles.bucketValue}>
-              {formatMinutes(
-                currentAisleMinutes
-              )}
+              {formatMinutes(currentAisleMinutes)}
             </Text>
           </View>
 
@@ -1281,11 +995,8 @@ export default function ScanLoadScreen() {
             <Text style={styles.bucketLabel}>
               Splitting
             </Text>
-
             <Text style={styles.splittingValue}>
-              {formatMinutes(
-                editableSplittingMinutes
-              )}
+              {formatMinutes(editableSplittingMinutes)}
             </Text>
           </View>
 
@@ -1293,11 +1004,8 @@ export default function ScanLoadScreen() {
             <Text style={styles.bucketLabel}>
               Promo
             </Text>
-
             <Text style={styles.bucketValue}>
-              {formatMinutes(
-                currentPromoMinutes
-              )}
+              {formatMinutes(currentPromoMinutes)}
             </Text>
           </View>
 
@@ -1305,11 +1013,8 @@ export default function ScanLoadScreen() {
             <Text style={styles.bucketLabel}>
               Protect
             </Text>
-
             <Text style={styles.bucketValue}>
-              {formatMinutes(
-                currentProtectMinutes
-              )}
+              {formatMinutes(currentProtectMinutes)}
             </Text>
           </View>
 
@@ -1322,11 +1027,8 @@ export default function ScanLoadScreen() {
             <Text style={styles.bucketLabel}>
               Other / Organising
             </Text>
-
             <Text style={styles.organisingValue}>
-              {formatMinutes(
-                otherOrganisingMinutes
-              )}
+              {formatMinutes(otherOrganisingMinutes)}
             </Text>
           </View>
 
@@ -1334,7 +1036,6 @@ export default function ScanLoadScreen() {
             <Text style={styles.bucketLabel}>
               Cartons
             </Text>
-
             <Text style={styles.bucketValue}>
               {currentTotalCartons}
             </Text>
@@ -1346,7 +1047,6 @@ export default function ScanLoadScreen() {
             <Text style={styles.warningTitle}>
               ⚠ Labour exceeds total
             </Text>
-
             <Text style={styles.warningText}>
               Your aisle, Promo, Protect and Splitting time add up to more than the Fill Assist total.
             </Text>
@@ -1361,121 +1061,109 @@ export default function ScanLoadScreen() {
           Correct any OCR mistakes before saving.
         </Text>
 
-        {items.map(
-          (
-            item,
-            index
-          ) => {
-            const active =
-              Number(item.cartons) > 0 ||
-              Number(item.hours) > 0 ||
-              Number(item.minutes) > 0;
+        {items.map((item, index) => {
+          const active =
+            Number(item.cartons) > 0 ||
+            Number(item.hours) > 0 ||
+            Number(item.minutes) > 0;
 
-            return (
-              <View
-                key={item.name}
-                style={[
-                  styles.aisleCard,
+          return (
+            <View
+              key={item.name}
+              style={[
+                styles.aisleCard,
+                active && styles.aisleCardActive,
+              ]}
+            >
+              <View style={styles.aisleTop}>
+                <Text style={styles.aisleName}>
+                  {item.name}
+                </Text>
 
-                  active &&
-                    styles.aisleCardActive,
-                ]}
-              >
-                <View style={styles.aisleTop}>
-                  <Text style={styles.aisleName}>
-                    {item.name}
+                {active && (
+                  <View style={styles.enteredBadge}>
+                    <Text style={styles.enteredText}>
+                      DETECTED
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              <View style={styles.entryRow}>
+                <View style={styles.field}>
+                  <Text style={styles.fieldLabel}>
+                    Cartons
                   </Text>
-
-                  {active && (
-                    <View style={styles.enteredBadge}>
-                      <Text style={styles.enteredText}>
-                        DETECTED
-                      </Text>
-                    </View>
-                  )}
+                  <TextInput
+                    style={styles.cartonInput}
+                    value={item.cartons}
+                    onChangeText={(value) =>
+                      updateItem(
+                        index,
+                        'cartons',
+                        value
+                      )
+                    }
+                    keyboardType="number-pad"
+                    placeholder="0"
+                  />
                 </View>
 
-                <View style={styles.entryRow}>
-                  <View style={styles.field}>
-                    <Text style={styles.fieldLabel}>
-                      Cartons
-                    </Text>
+                <View style={styles.timeField}>
+                  <Text style={styles.fieldLabel}>
+                    Expected
+                  </Text>
 
-                    <TextInput
-                      style={styles.cartonInput}
-                      value={item.cartons}
-                      onChangeText={(value) =>
-                        updateItem(
-                          index,
-                          'cartons',
-                          value
-                        )
-                      }
-                      keyboardType="number-pad"
-                      placeholder="0"
-                    />
-                  </View>
+                  <View style={styles.timeRow}>
+                    <View style={styles.timeInputBox}>
+                      <TextInput
+                        style={styles.timeInput}
+                        value={item.hours}
+                        onChangeText={(value) =>
+                          updateItem(
+                            index,
+                            'hours',
+                            value
+                          )
+                        }
+                        keyboardType="number-pad"
+                        placeholder="0"
+                      />
+                      <Text style={styles.timeSuffix}>
+                        h
+                      </Text>
+                    </View>
 
-                  <View style={styles.timeField}>
-                    <Text style={styles.fieldLabel}>
-                      Expected
-                    </Text>
-
-                    <View style={styles.timeRow}>
-                      <View style={styles.timeInputBox}>
-                        <TextInput
-                          style={styles.timeInput}
-                          value={item.hours}
-                          onChangeText={(value) =>
-                            updateItem(
-                              index,
-                              'hours',
-                              value
-                            )
-                          }
-                          keyboardType="number-pad"
-                          placeholder="0"
-                        />
-
-                        <Text style={styles.timeSuffix}>
-                          h
-                        </Text>
-                      </View>
-
-                      <View style={styles.timeInputBox}>
-                        <TextInput
-                          style={styles.timeInput}
-                          value={item.minutes}
-                          onChangeText={(value) =>
-                            updateItem(
-                              index,
-                              'minutes',
-                              value
-                            )
-                          }
-                          keyboardType="number-pad"
-                          maxLength={2}
-                          placeholder="0"
-                        />
-
-                        <Text style={styles.timeSuffix}>
-                          m
-                        </Text>
-                      </View>
+                    <View style={styles.timeInputBox}>
+                      <TextInput
+                        style={styles.timeInput}
+                        value={item.minutes}
+                        onChangeText={(value) =>
+                          updateItem(
+                            index,
+                            'minutes',
+                            value
+                          )
+                        }
+                        keyboardType="number-pad"
+                        maxLength={2}
+                        placeholder="0"
+                      />
+                      <Text style={styles.timeSuffix}>
+                        m
+                      </Text>
                     </View>
                   </View>
                 </View>
               </View>
-            );
-          }
-        )}
+            </View>
+          );
+        })}
 
         <TouchableOpacity
           style={[
             styles.saveButton,
-
-            saving &&
-              styles.disabledButton,
+            saving && styles.disabledButton,
           ]}
           disabled={saving}
           onPress={saveLoad}
@@ -1496,68 +1184,57 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#F4F6FA',
   },
-
   center: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#F4F6FA',
   },
-
   loadingText: {
     color: '#667085',
   },
-
   header: {
     backgroundColor: '#101D48',
     paddingTop: 65,
     paddingHorizontal: 22,
     paddingBottom: 25,
   },
-
   back: {
     color: '#D5DBED',
     fontSize: 14,
     marginBottom: 14,
   },
-
   title: {
     color: '#FFFFFF',
     fontSize: 30,
     fontWeight: '800',
   },
-
   subtitle: {
     color: '#D5DBED',
     fontSize: 12,
     marginTop: 5,
   },
-
   content: {
     padding: 16,
     paddingBottom: 50,
   },
-
   sectionHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 10,
   },
-
   sectionTitleNoMargin: {
     color: '#101828',
     fontSize: 17,
     fontWeight: '800',
   },
-
   sectionSubtitle: {
     color: '#667085',
     fontSize: 10,
     marginTop: 3,
     maxWidth: 260,
   },
-
   photoCount: {
     width: 34,
     height: 34,
@@ -1566,30 +1243,25 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-
   photoCountText: {
     color: '#2436B2',
     fontWeight: '800',
   },
-
   emptyPhotoCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
     padding: 24,
     alignItems: 'center',
   },
-
   cameraEmoji: {
     fontSize: 34,
   },
-
   emptyPhotoTitle: {
     color: '#101828',
     fontSize: 15,
     fontWeight: '800',
     marginTop: 8,
   },
-
   emptyPhotoText: {
     color: '#667085',
     fontSize: 10,
@@ -1597,23 +1269,19 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 5,
   },
-
   photosRow: {
     gap: 10,
   },
-
   photoWrapper: {
     width: 150,
     height: 210,
     borderRadius: 14,
     overflow: 'hidden',
   },
-
   photo: {
     width: '100%',
     height: '100%',
   },
-
   photoNumber: {
     position: 'absolute',
     top: 8,
@@ -1625,13 +1293,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-
   photoNumberText: {
     color: '#FFFFFF',
     fontSize: 11,
     fontWeight: '800',
   },
-
   removePhoto: {
     position: 'absolute',
     top: 8,
@@ -1643,18 +1309,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-
   removePhotoText: {
     color: '#D92D20',
     fontSize: 18,
   },
-
   photoButtons: {
     flexDirection: 'row',
     gap: 8,
     marginTop: 10,
   },
-
   cameraButton: {
     flex: 1,
     backgroundColor: '#2436B2',
@@ -1662,13 +1325,11 @@ const styles = StyleSheet.create({
     borderRadius: 11,
     alignItems: 'center',
   },
-
   cameraButtonText: {
     color: '#FFFFFF',
     fontSize: 11,
     fontWeight: '800',
   },
-
   galleryButton: {
     width: 100,
     backgroundColor: '#FFFFFF',
@@ -1676,13 +1337,11 @@ const styles = StyleSheet.create({
     borderRadius: 11,
     alignItems: 'center',
   },
-
   galleryButtonText: {
     color: '#2436B2',
     fontSize: 11,
     fontWeight: '800',
   },
-
   analyzeButton: {
     backgroundColor: '#6D5DFB',
     borderRadius: 13,
@@ -1690,51 +1349,43 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 12,
   },
-
   analyzeButtonText: {
     color: '#FFFFFF',
     fontSize: 13,
     fontWeight: '800',
   },
-
   disabledButton: {
     opacity: 0.5,
   },
-
   detectedBanner: {
     backgroundColor: '#E8F8EF',
     borderRadius: 10,
     padding: 10,
     marginTop: 8,
   },
-
   detectedText: {
     color: '#168455',
     textAlign: 'center',
     fontSize: 10,
     fontWeight: '700',
   },
-
   warningCard: {
     backgroundColor: '#FFF4E5',
     borderRadius: 12,
     padding: 12,
     marginTop: 8,
   },
-
   warningTitle: {
     color: '#B54708',
     fontSize: 11,
     fontWeight: '800',
   },
-
   warningText: {
     color: '#7A2E0E',
     fontSize: 9,
     lineHeight: 14,
     marginTop: 3,
   },
-
   sectionTitle: {
     color: '#101828',
     fontSize: 17,
@@ -1742,7 +1393,6 @@ const styles = StyleSheet.create({
     marginTop: 20,
     marginBottom: 8,
   },
-
   masterTotalCard: {
     backgroundColor: '#101D48',
     borderRadius: 16,
@@ -1751,25 +1401,21 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-
   masterTotalLabel: {
     color: '#FFFFFF',
     fontSize: 12,
     fontWeight: '800',
   },
-
   masterTotalSubtext: {
     color: '#AEB9DD',
     fontSize: 8,
     marginTop: 3,
   },
-
   masterTotalValue: {
     color: '#FFFFFF',
     fontSize: 26,
     fontWeight: '800',
   },
-
   splittingCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
@@ -1778,38 +1424,32 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#D7DDFE',
   },
-
   splittingHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-
   splittingTitle: {
     color: '#101828',
     fontSize: 16,
     fontWeight: '800',
   },
-
   splittingSubtitle: {
     color: '#667085',
     fontSize: 9,
     marginTop: 3,
     maxWidth: 230,
   },
-
   splittingTotal: {
     color: '#6D5DFB',
     fontSize: 19,
     fontWeight: '800',
   },
-
   splittingInputs: {
     flexDirection: 'row',
     gap: 8,
     marginTop: 12,
   },
-
   splittingInputBox: {
     flex: 1,
     backgroundColor: '#F2F4F7',
@@ -1818,7 +1458,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 10,
   },
-
   splittingInput: {
     flex: 1,
     paddingVertical: 11,
@@ -1826,64 +1465,54 @@ const styles = StyleSheet.create({
     color: '#101D48',
     fontWeight: '800',
   },
-
   splittingSuffix: {
     color: '#667085',
     fontSize: 9,
   },
-
   bucketGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
     marginTop: 8,
   },
-
   bucketCard: {
     width: '48.5%',
     backgroundColor: '#FFFFFF',
     borderRadius: 12,
     padding: 12,
   },
-
   organisingCard: {
     borderWidth: 1,
     borderColor: '#D7DDFE',
   },
-
   bucketLabel: {
     color: '#667085',
     fontSize: 9,
   },
-
   bucketValue: {
     color: '#101D48',
     fontSize: 17,
     fontWeight: '800',
     marginTop: 5,
   },
-
   splittingValue: {
     color: '#6D5DFB',
     fontSize: 17,
     fontWeight: '800',
     marginTop: 5,
   },
-
   organisingValue: {
     color: '#2436B2',
     fontSize: 17,
     fontWeight: '800',
     marginTop: 5,
   },
-
   helperText: {
     color: '#667085',
     fontSize: 10,
     lineHeight: 16,
     marginBottom: 10,
   },
-
   aisleCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 14,
@@ -1892,55 +1521,45 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#FFFFFF',
   },
-
   aisleCardActive: {
     borderColor: '#C7D0FF',
   },
-
   aisleTop: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginBottom: 10,
   },
-
   aisleName: {
     color: '#101828',
     fontSize: 14,
     fontWeight: '800',
   },
-
   enteredBadge: {
     backgroundColor: '#E8F8EF',
     borderRadius: 7,
     paddingHorizontal: 7,
     paddingVertical: 4,
   },
-
   enteredText: {
     color: '#168455',
     fontSize: 7,
     fontWeight: '800',
   },
-
   entryRow: {
     flexDirection: 'row',
     gap: 10,
   },
-
   field: {
     flex: 1,
   },
-
   timeField: {
     flex: 1.5,
   },
-
   fieldLabel: {
     color: '#98A2B3',
     fontSize: 9,
     marginBottom: 5,
   },
-
   cartonInput: {
     backgroundColor: '#F2F4F7',
     borderRadius: 9,
@@ -1948,12 +1567,10 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     fontWeight: '800',
   },
-
   timeRow: {
     flexDirection: 'row',
     gap: 6,
   },
-
   timeInputBox: {
     flex: 1,
     flexDirection: 'row',
@@ -1962,19 +1579,16 @@ const styles = StyleSheet.create({
     borderRadius: 9,
     paddingHorizontal: 7,
   },
-
   timeInput: {
     flex: 1,
     textAlign: 'center',
     paddingVertical: 10,
     fontWeight: '800',
   },
-
   timeSuffix: {
     color: '#667085',
     fontSize: 9,
   },
-
   saveButton: {
     backgroundColor: '#2436B2',
     borderRadius: 14,
@@ -1982,7 +1596,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 20,
   },
-
   saveText: {
     color: '#FFFFFF',
     fontSize: 14,
