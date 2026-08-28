@@ -19,6 +19,7 @@ export const NIGHTFILL_STORAGE = {
   progress: 'groceryNightProgress',
   arrivals: 'groceryLoadArrivals',
   reports: 'groceryNightReports',
+  helpActions: 'groceryNightHelpActions',
 } as const;
 
 export type NightfillStorageKey =
