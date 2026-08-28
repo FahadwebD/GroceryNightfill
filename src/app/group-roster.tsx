@@ -2,6 +2,8 @@ import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
 import {
   Alert,
+  KeyboardAvoidingView,
+  Platform,
   ScrollView,
   Share,
   StyleSheet,
@@ -265,74 +267,91 @@ export default function GroupRosterScreen() {
         </Text>
       </View>
 
-      <ScrollView
-        contentContainerStyle={styles.content}
-        showsVerticalScrollIndicator={false}
-        keyboardShouldPersistTaps="handled"
+      <KeyboardAvoidingView
+        style={styles.keyboardArea}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={0}
       >
         <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.dayRow}
+          contentContainerStyle={styles.content}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+          automaticallyAdjustKeyboardInsets={Platform.OS === 'ios'}
         >
-          {days.map((day) => {
-            const active = day === selectedDay;
-            return (
-              <TouchableOpacity
-                key={day}
-                style={[styles.dayButton, active && styles.dayButtonActive]}
-                onPress={() => setSelectedDay(day)}
-              >
-                <Text style={[styles.dayText, active && styles.dayTextActive]}>
-                  {day.slice(0, 3)}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.dayRow}
+            keyboardShouldPersistTaps="handled"
+          >
+            {days.map((day) => {
+              const active = day === selectedDay;
+              return (
+                <TouchableOpacity
+                  key={day}
+                  style={[styles.dayButton, active && styles.dayButtonActive]}
+                  onPress={() => setSelectedDay(day)}
+                >
+                  <Text style={[styles.dayText, active && styles.dayTextActive]}>
+                    {day.slice(0, 3)}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+
+          <View style={styles.dateCard}>
+            <Text style={styles.dateTitle}>{selectedDay} Nightfill</Text>
+            <Text style={styles.dateText}>{selectedDateKey}</Text>
+          </View>
+
+          <View style={styles.infoCard}>
+            <Text style={styles.infoTitle}>Group format</Text>
+            <Text style={styles.infoText}>
+              Times are shortened like 17-24 and 21:30-1. Saved aisle allocations become A/7 or A/1-2-3. Night Captain is marked automatically.
+            </Text>
+          </View>
+
+          <Text style={styles.sectionTitle}>Message Preview</Text>
+          <TextInput
+            value={draft}
+            onChangeText={setDraft}
+            multiline
+            textAlignVertical="top"
+            style={styles.preview}
+            selectionColor="#2436B2"
+            scrollEnabled
+          />
+
+          <Text style={styles.helpText}>
+            The editor now stays above the keyboard. You can scroll the message while typing, then use the buttons below without dismissing the keyboard first.
+          </Text>
         </ScrollView>
 
-        <View style={styles.dateCard}>
-          <Text style={styles.dateTitle}>{selectedDay} Nightfill</Text>
-          <Text style={styles.dateText}>{selectedDateKey}</Text>
-        </View>
-
-        <View style={styles.infoCard}>
-          <Text style={styles.infoTitle}>Group format</Text>
-          <Text style={styles.infoText}>
-            Times are shortened like 17-24 and 21:30-1. Saved aisle allocations become A/7 or A/1-2-3. Night Captain is marked automatically.
-          </Text>
-        </View>
-
-        <Text style={styles.sectionTitle}>Message Preview</Text>
-        <TextInput
-          value={draft}
-          onChangeText={setDraft}
-          multiline
-          textAlignVertical="top"
-          style={styles.preview}
-          selectionColor="#2436B2"
-        />
-
-        <View style={styles.buttonRow}>
-          <TouchableOpacity style={styles.secondaryButton} onPress={regenerate}>
+        <View style={styles.stickyActions}>
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={regenerate}
+          >
             <Text style={styles.secondaryText}>Reset from Roster</Text>
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.primaryButton} onPress={shareRoster}>
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={shareRoster}
+          >
             <Text style={styles.primaryText}>Share to Group</Text>
           </TouchableOpacity>
         </View>
-
-        <Text style={styles.helpText}>
-          You can edit the message here first. To copy instead of sharing, long-press the text, Select All, then Copy.
-        </Text>
-      </ScrollView>
+      </KeyboardAvoidingView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F4F6FA' },
+  keyboardArea: { flex: 1 },
   center: {
     flex: 1,
     alignItems: 'center',
@@ -365,7 +384,10 @@ const styles = StyleSheet.create({
     lineHeight: 16,
     marginTop: 4,
   },
-  content: { padding: 16, paddingBottom: 50 },
+  content: {
+    padding: 16,
+    paddingBottom: 24,
+  },
   dayRow: { gap: 7, paddingBottom: 12 },
   dayButton: {
     width: 52,
@@ -404,7 +426,8 @@ const styles = StyleSheet.create({
     marginBottom: 9,
   },
   preview: {
-    minHeight: 360,
+    minHeight: 300,
+    maxHeight: 430,
     backgroundColor: '#FFFFFF',
     borderRadius: 14,
     padding: 16,
@@ -414,10 +437,15 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#E4E7EC',
   },
-  buttonRow: {
+  stickyActions: {
     flexDirection: 'row',
     gap: 10,
-    marginTop: 12,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: Platform.OS === 'ios' ? 12 : 10,
+    backgroundColor: '#FFFFFF',
+    borderTopWidth: 1,
+    borderTopColor: '#E4E7EC',
   },
   secondaryButton: {
     flex: 1,
