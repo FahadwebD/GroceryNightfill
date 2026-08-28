@@ -24,6 +24,8 @@ export type SuggestedAllocation = PlanningAllocation & {
   skillRating: number | null;
   reason: string;
   recovery?: boolean;
+  /** Standard Fill Assist labour represented by this target-time allocation. */
+  standardMinutes?: number;
 };
 
 export type UnallocatedTask = {
@@ -40,6 +42,7 @@ export type AllocationSuggestionResult = {
   recoveryMode: boolean;
   shortageMinutes: number;
   requiredPacePercent: number | null;
+  paceMultiplier: number;
   totalRequiredMinutes: number;
   totalAvailableMinutes: number;
 };
@@ -51,10 +54,11 @@ type Candidate = {
   shiftStartMinute: number;
   capacityMinutes: number;
   assignedMinutes: number;
+  remainingMinutes: number;
   loadRatio: number;
 };
 
-const CHUNK_MINUTES = 15;
+const TARGET_CHUNK_MINUTES = 15;
 
 function mergeAllocation(
   allocations: SuggestedAllocation[],
@@ -70,10 +74,13 @@ function mergeAllocation(
 
   if (existing) {
     existing.minutes += next.minutes;
+    existing.standardMinutes =
+      (existing.standardMinutes ?? existing.minutes) +
+      (next.standardMinutes ?? next.minutes);
     return;
   }
 
-  allocations.push(next);
+  allocations.push({ ...next });
 }
 
 function getTaskSkill(
@@ -106,6 +113,10 @@ function buildCandidates(
         assignedByEmployee[entry.employeeId] || 0,
         0
       );
+      const remainingMinutes = Math.max(
+        capacityMinutes - assignedMinutes,
+        0
+      );
 
       return {
         employeeId: entry.employeeId,
@@ -114,27 +125,30 @@ function buildCandidates(
         shiftStartMinute: getShiftWindow(entry).startMinute,
         capacityMinutes,
         assignedMinutes,
+        remainingMinutes,
         loadRatio:
           capacityMinutes > 0
             ? assignedMinutes / capacityMinutes
             : 999,
       };
     })
-    .filter((candidate) => candidate.capacityMinutes > 0);
+    .filter(
+      (candidate) =>
+        candidate.capacityMinutes > 0 &&
+        candidate.remainingMinutes > 0
+    );
 }
 
 function candidateScore(task: SuggestionTask, candidate: Candidate) {
-  /* Aisle skill is strong, but not so strong that one skilled person gets all overload. */
   const skillScore = task.name.startsWith('Aisle ')
     ? candidate.skillRating * 120
     : 0;
 
-  /* Spread work according to how loaded each person already is versus real post-load time. */
-  const balanceScore = -candidate.loadRatio * 70;
-  const capacityScore = candidate.capacityMinutes / 30;
+  const balanceScore = -candidate.loadRatio * 90;
+  const remainingScore = candidate.remainingMinutes / 20;
   const earlierStartTieBreaker = -candidate.shiftStartMinute / 10000;
 
-  return skillScore + balanceScore + capacityScore + earlierStartTieBreaker;
+  return skillScore + balanceScore + remainingScore + earlierStartTieBreaker;
 }
 
 function chooseCandidate(
@@ -169,22 +183,20 @@ function chooseCandidate(
 function makeReason(
   task: SuggestionTask,
   candidate: Candidate,
-  recovery: boolean,
-  projectedAssigned: number
+  recoveryMode: boolean,
+  paceMultiplier: number
 ) {
-  const capacityText = `${candidate.capacityMinutes}m post-load capacity`;
-  const projectedOverload = Math.max(
-    projectedAssigned - candidate.capacityMinutes,
-    0
-  );
+  const capacityText = `${Math.round(candidate.capacityMinutes)}m post-load capacity`;
 
-  if (recovery) {
+  if (recoveryMode) {
     const skillText =
       task.name.startsWith('Aisle ') && candidate.skillRating > 0
         ? ` · skill ${candidate.skillRating}/5`
         : '';
 
-    return `Recovery allocation${skillText} · ${capacityText} · ${projectedOverload}m above capacity`;
+    return `Recovery target${skillText} · ${capacityText} · ${paceMultiplier.toFixed(
+      2
+    )}× standard pace`;
   }
 
   if (task.name.startsWith('Aisle ') && candidate.skillRating > 0) {
@@ -202,18 +214,68 @@ function makeReason(
   return `Best workload match · ${capacityText}`;
 }
 
-function allocateTask(
+function buildTaskTargets(
+  tasks: SuggestionTask[],
+  totalAvailableMinutes: number,
+  totalRequiredMinutes: number,
+  recoveryMode: boolean
+) {
+  const targets: Record<string, number> = {};
+
+  if (!recoveryMode || totalRequiredMinutes <= 0) {
+    for (const task of tasks) {
+      targets[task.name] = Math.max(Math.round(task.requiredMinutes), 0);
+    }
+    return targets;
+  }
+
+  const raw = tasks.map((task) => ({
+    name: task.name,
+    raw:
+      (Math.max(task.requiredMinutes, 0) / totalRequiredMinutes) *
+      totalAvailableMinutes,
+  }));
+
+  let used = 0;
+  for (const item of raw) {
+    const floor = Math.floor(item.raw);
+    targets[item.name] = floor;
+    used += floor;
+  }
+
+  let remaining = Math.max(Math.round(totalAvailableMinutes) - used, 0);
+  const byRemainder = [...raw].sort(
+    (a, b) =>
+      b.raw - Math.floor(b.raw) - (a.raw - Math.floor(a.raw))
+  );
+
+  let index = 0;
+  while (remaining > 0 && byRemainder.length > 0) {
+    const item = byRemainder[index % byRemainder.length];
+    targets[item.name] = (targets[item.name] || 0) + 1;
+    remaining -= 1;
+    index += 1;
+  }
+
+  return targets;
+}
+
+function allocateTaskTarget(
   task: SuggestionTask,
-  taskRemaining: number,
+  targetMinutes: number,
+  standardMinutes: number,
   activeRoster: PlanningRosterEntry[],
   employeesById: Map<string, SuggestionEmployee>,
   capacityByEmployee: Record<string, number>,
   assignedByEmployee: Record<string, number>,
-  suggestions: SuggestedAllocation[]
+  suggestions: SuggestedAllocation[],
+  recoveryMode: boolean,
+  paceMultiplier: number
 ) {
-  let remaining = Math.max(taskRemaining, 0);
+  let targetRemaining = Math.max(Math.round(targetMinutes), 0);
+  let standardRemaining = Math.max(standardMinutes, 0);
 
-  while (remaining > 0) {
+  while (targetRemaining > 0) {
     const candidate = chooseCandidate(
       task,
       activeRoster,
@@ -224,28 +286,55 @@ function allocateTask(
 
     if (!candidate) break;
 
-    const minutes = Math.min(CHUNK_MINUTES, remaining);
-    const currentAssigned = assignedByEmployee[candidate.employeeId] || 0;
-    const projectedAssigned = currentAssigned + minutes;
-    const recovery = projectedAssigned > candidate.capacityMinutes;
+    const targetChunk = Math.min(
+      TARGET_CHUNK_MINUTES,
+      targetRemaining,
+      candidate.remainingMinutes
+    );
+
+    if (targetChunk <= 0) break;
+
+    const standardChunk =
+      targetChunk === targetRemaining
+        ? standardRemaining
+        : Math.min(
+            standardRemaining,
+            recoveryMode
+              ? targetChunk * paceMultiplier
+              : targetChunk
+          );
 
     mergeAllocation(suggestions, {
       employeeId: candidate.employeeId,
       taskName: task.name,
-      minutes,
+      minutes: targetChunk,
+      standardMinutes: standardChunk,
       source: 'suggested',
       skillRating: task.name.startsWith('Aisle ')
         ? candidate.skillRating
         : null,
-      reason: makeReason(task, candidate, recovery, projectedAssigned),
-      recovery,
+      reason: makeReason(
+        task,
+        candidate,
+        recoveryMode,
+        paceMultiplier
+      ),
+      recovery: recoveryMode,
     });
 
-    assignedByEmployee[candidate.employeeId] = projectedAssigned;
-    remaining -= minutes;
+    assignedByEmployee[candidate.employeeId] =
+      (assignedByEmployee[candidate.employeeId] || 0) + targetChunk;
+    targetRemaining -= targetChunk;
+    standardRemaining = Math.max(
+      standardRemaining - standardChunk,
+      0
+    );
   }
 
-  return remaining;
+  return {
+    targetRemaining,
+    standardRemaining,
+  };
 }
 
 export function buildAllocationSuggestions({
@@ -304,18 +393,20 @@ export function buildAllocationSuggestions({
     0
   );
   const recoveryMode = shortageMinutes > 0;
-  const requiredPacePercent =
+  const paceMultiplier =
     totalAvailableMinutes > 0
-      ? Math.ceil((totalRequiredMinutes / totalAvailableMinutes) * 100)
+      ? Math.max(totalRequiredMinutes / totalAvailableMinutes, 1)
       : totalRequiredMinutes > 0
-        ? null
-        : 100;
+        ? Infinity
+        : 1;
+  const requiredPacePercent =
+    Number.isFinite(paceMultiplier)
+      ? Math.ceil(paceMultiplier * 100)
+      : null;
 
   /*
-   * Critical late-load rule:
-   * If the actual arrival creates a real shortage, generate a fresh recovery
-   * suggestion rather than preserving a provisional pre-arrival allocation.
-   * The manager's saved allocation is not deleted until they explicitly save.
+   * If actual arrival creates shortage, previous provisional allocations are
+   * not treated as fixed. We build a fresh target-time recovery suggestion.
    */
   const effectivePreserveExisting = preserveExisting && !recoveryMode;
 
@@ -335,6 +426,7 @@ export function buildAllocationSuggestions({
   const existingSuggestedShape: SuggestedAllocation[] = retainedExisting.map(
     (allocation) => ({
       ...allocation,
+      standardMinutes: allocation.minutes,
       source: 'existing',
       skillRating: null,
       reason: 'Existing manager allocation preserved',
@@ -342,7 +434,7 @@ export function buildAllocationSuggestions({
     })
   );
 
-  const taskExistingMinutes = retainedExisting.reduce<Record<string, number>>(
+  const existingByTask = retainedExisting.reduce<Record<string, number>>(
     (result, allocation) => {
       result[allocation.taskName] =
         (result[allocation.taskName] || 0) + allocation.minutes;
@@ -354,28 +446,51 @@ export function buildAllocationSuggestions({
   const suggestions: SuggestedAllocation[] = [];
   const unallocatedTasks: UnallocatedTask[] = [];
 
+  const taskTargets = buildTaskTargets(
+    orderedTasks,
+    totalAvailableMinutes,
+    totalRequiredMinutes,
+    recoveryMode
+  );
+
   for (const task of orderedTasks) {
-    const remainingForTask = Math.max(
-      task.requiredMinutes - (taskExistingMinutes[task.name] || 0),
+    const existingMinutes = existingByTask[task.name] || 0;
+    const standardRemaining = Math.max(
+      task.requiredMinutes - existingMinutes,
       0
     );
 
-    if (remainingForTask === 0) continue;
+    if (standardRemaining <= 0) continue;
 
-    const remaining = allocateTask(
+    const targetMinutes = recoveryMode
+      ? taskTargets[task.name] || 0
+      : standardRemaining;
+
+    if (targetMinutes <= 0) {
+      unallocatedTasks.push({
+        taskName: task.name,
+        remainingMinutes: standardRemaining,
+      });
+      continue;
+    }
+
+    const result = allocateTaskTarget(
       task,
-      remainingForTask,
+      targetMinutes,
+      standardRemaining,
       activeRoster,
       employeesById,
       capacityByEmployee,
       assignedByEmployee,
-      suggestions
+      suggestions,
+      recoveryMode,
+      Number.isFinite(paceMultiplier) ? paceMultiplier : 1
     );
 
-    if (remaining > 0) {
+    if (result.targetRemaining > 0 || result.standardRemaining > 0.5) {
       unallocatedTasks.push({
         taskName: task.name,
-        remainingMinutes: remaining,
+        remainingMinutes: Math.max(result.standardRemaining, 0),
       });
     }
   }
@@ -384,12 +499,16 @@ export function buildAllocationSuggestions({
   const employeeOverloadMinutes: Record<string, number> = {};
 
   for (const entry of activeRoster) {
-    const employeeId = entry.employeeId;
-    const capacity = capacityByEmployee[employeeId] || 0;
-    const assigned = assignedByEmployee[employeeId] || 0;
-
-    employeeRemainingMinutes[employeeId] = Math.max(capacity - assigned, 0);
-    employeeOverloadMinutes[employeeId] = Math.max(assigned - capacity, 0);
+    const capacity = capacityByEmployee[entry.employeeId] || 0;
+    const assigned = assignedByEmployee[entry.employeeId] || 0;
+    employeeRemainingMinutes[entry.employeeId] = Math.max(
+      capacity - assigned,
+      0
+    );
+    employeeOverloadMinutes[entry.employeeId] = Math.max(
+      assigned - capacity,
+      0
+    );
   }
 
   return {
@@ -401,6 +520,8 @@ export function buildAllocationSuggestions({
     recoveryMode,
     shortageMinutes,
     requiredPacePercent,
+    paceMultiplier:
+      Number.isFinite(paceMultiplier) ? paceMultiplier : 1,
     totalRequiredMinutes,
     totalAvailableMinutes,
   };
