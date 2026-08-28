@@ -18,7 +18,9 @@ function notifyListeners() {
 
 export function subscribeManagerSecurity(listener: SecurityListener) {
   listeners.add(listener);
-  return () => listeners.delete(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
 export async function getManagerSecurity(): Promise<ManagerSecurityRecord | null> {
