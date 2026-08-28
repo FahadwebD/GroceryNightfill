@@ -31,6 +31,9 @@ export const NIGHTFILL_STORAGE = {
     'groceryNightReports',
 } as const;
 
+export type NightfillStorageKey =
+  (typeof NIGHTFILL_STORAGE)[keyof typeof NIGHTFILL_STORAGE];
+
 /*
 |--------------------------------------------------------------------------
 | DATE CONTEXT
@@ -48,9 +51,14 @@ export const NIGHTFILL_STORAGE = {
 |--------------------------------------------------------------------------
 */
 
-export function getTonightContext() {
+export function getTonightContext(
+  sourceDate: Date =
+    new Date()
+) {
   const date =
-    getNightfillDate();
+    getNightfillDate(
+      sourceDate
+    );
 
   return {
     date,
@@ -69,6 +77,20 @@ export function getTonightContext() {
         }
       ),
   };
+}
+
+/*
+|--------------------------------------------------------------------------
+| DATE KEY CHECK
+|--------------------------------------------------------------------------
+*/
+
+export function isNightDateKey(
+  value: string
+) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(
+    value
+  );
 }
 
 /*
@@ -199,13 +221,15 @@ export async function readNightValue<
 | SAVE NIGHT VALUE
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
+| dateKey is always the permanent record.
 |
-| New data is ONLY written
-| against YYYY-MM-DD.
+| legacyDayName is optional and exists only while older screens still read
+| Monday / Tuesday / Wednesday keys. When supplied, we keep that weekday key
+| as a compatibility mirror without sacrificing the permanent YYYY-MM-DD
+| archive.
 |
-| We do NOT write back to
-| Tuesday / Wednesday etc.
+| Once every screen has been migrated, callers can stop supplying
+| legacyDayName and the weekday mirror can be retired.
 |
 |--------------------------------------------------------------------------
 */
@@ -215,7 +239,8 @@ export async function saveNightValue<
 >(
   storageKey: string,
   dateKey: string,
-  value: T
+  value: T,
+  legacyDayName?: string
 ) {
   const record =
     await readStorage<
@@ -233,9 +258,204 @@ export async function saveNightValue<
   ] =
     value;
 
+  if (
+    legacyDayName
+  ) {
+    record[
+      legacyDayName
+    ] =
+      value;
+  }
+
   await writeStorage(
     storageKey,
     record
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| SAVE TONIGHT VALUE
+|--------------------------------------------------------------------------
+|
+| Convenience wrapper for screens that are operating on the current
+| Nightfill. It writes a permanent date-key record and a temporary weekday
+| compatibility mirror in one operation.
+|
+|--------------------------------------------------------------------------
+*/
+
+export async function saveTonightValue<
+  T
+>(
+  storageKey: string,
+  value: T,
+  sourceDate: Date =
+    new Date()
+) {
+  const {
+    dateKey,
+    dayName,
+  } =
+    getTonightContext(
+      sourceDate
+    );
+
+  await saveNightValue(
+    storageKey,
+    dateKey,
+    value,
+    dayName
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| MIGRATE ONE LEGACY NIGHT VALUE
+|--------------------------------------------------------------------------
+|
+| If a real YYYY-MM-DD record does not exist yet, copy the old weekday value
+| into the date-key archive. Existing date-key data is never overwritten by
+| legacy data.
+|
+|--------------------------------------------------------------------------
+*/
+
+export async function migrateLegacyNightValue<
+  T
+>(
+  storageKey: string,
+  dateKey: string,
+  legacyDayName: string
+) {
+  const record =
+    await readStorage<
+      Record<
+        string,
+        T
+      >
+    >(
+      storageKey,
+      {}
+    );
+
+  if (
+    record[
+      dateKey
+    ] !==
+      undefined ||
+    record[
+      legacyDayName
+    ] ===
+      undefined
+  ) {
+    return false;
+  }
+
+  record[
+    dateKey
+  ] =
+    record[
+      legacyDayName
+    ];
+
+  await writeStorage(
+    storageKey,
+    record
+  );
+
+  return true;
+}
+
+/*
+|--------------------------------------------------------------------------
+| MIGRATE TONIGHT'S LEGACY DATA
+|--------------------------------------------------------------------------
+|
+| This is deliberately one-way: weekday -> date key only when the date key
+| is missing. It never lets an older weekday value overwrite a permanent
+| dated record.
+|
+| Reports are excluded because duplicating report keys can create duplicate
+| History rows. Night Summary already saves reports by date key.
+|
+|--------------------------------------------------------------------------
+*/
+
+export async function migrateTonightLegacyData(
+  sourceDate: Date =
+    new Date()
+) {
+  const {
+    dateKey,
+    dayName,
+  } =
+    getTonightContext(
+      sourceDate
+    );
+
+  const keys: string[] = [
+    NIGHTFILL_STORAGE.roster,
+    NIGHTFILL_STORAGE.loads,
+    NIGHTFILL_STORAGE.allocations,
+    NIGHTFILL_STORAGE.progress,
+    NIGHTFILL_STORAGE.arrivals,
+  ];
+
+  let migratedCount =
+    0;
+
+  for (
+    const key of keys
+  ) {
+    const migrated =
+      await migrateLegacyNightValue(
+        key,
+        dateKey,
+        dayName
+      );
+
+    if (
+      migrated
+    ) {
+      migratedCount +=
+        1;
+    }
+  }
+
+  return {
+    dateKey,
+    dayName,
+    migratedCount,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| DATE-KEY ENTRIES
+|--------------------------------------------------------------------------
+|
+| Useful for History / Analytics so legacy weekday compatibility keys never
+| appear as duplicate nights.
+|
+|--------------------------------------------------------------------------
+*/
+
+export function getDatedEntries<
+  T
+>(
+  record: Record<
+    string,
+    T
+  >
+) {
+  return Object.entries(
+    record
+  ).filter(
+    ([key]) =>
+      isNightDateKey(
+        key
+      )
   );
 }
 
@@ -247,7 +467,8 @@ export async function saveNightValue<
 
 export async function deleteNightValue(
   storageKey: string,
-  dateKey: string
+  dateKey: string,
+  legacyDayName?: string
 ) {
   const record =
     await readStorage<
@@ -263,6 +484,14 @@ export async function deleteNightValue(
   delete record[
     dateKey
   ];
+
+  if (
+    legacyDayName
+  ) {
+    delete record[
+      legacyDayName
+    ];
+  }
 
   await writeStorage(
     storageKey,
