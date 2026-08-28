@@ -74,6 +74,10 @@ yarn-error.*
 # Grocery Nightfill OCR temporary files
 # --------------------------------------------------
 
+# Current OCR server writes to process.cwd()/uploads
+/uploads/
+
+# Keep older/alternate temp locations ignored too
 server/uploads/
 server/processed/
 server/temp/
